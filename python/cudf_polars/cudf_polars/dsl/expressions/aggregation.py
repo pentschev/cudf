@@ -132,7 +132,7 @@ class Agg(Expr):
                 self.dtype,
                 self.name,
                 self.options,
-                self.children,
+                *self.children,
             ),
         )
 
