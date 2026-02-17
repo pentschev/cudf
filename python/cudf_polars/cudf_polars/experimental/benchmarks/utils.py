@@ -558,6 +558,13 @@ def _setup_rmm_for_rrun(args: argparse.Namespace, rank: int) -> None:  # type: i
             # Assume it's a fraction
             total_memory = rmm.mr.available_device_memory()[1]
             pool_size = int(total_memory * args.rmm_pool_size)
+    elif args.rmm_async:
+        # When rmm_async is True, CLI leaves rmm_pool_size as None. For rrun we must
+        # use a pool to avoid GPU memory fragmentation across queries (Dask workers
+        # get a pool via dask-cuda RMMPlugin). Use 80% of device memory by default.
+        total_memory = rmm.mr.available_device_memory()[1]
+        _DEFAULT_RRUN_ASYNC_POOL_FRACTION = 0.8
+        pool_size = int(total_memory * _DEFAULT_RRUN_ASYNC_POOL_FRACTION)
 
     # Set up RMM resource based on configuration
     if args.rmm_async:
