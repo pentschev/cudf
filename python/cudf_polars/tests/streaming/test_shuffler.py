@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from rapidsmpf.statistics import Formatter
 from rapidsmpf.streaming.cudf.channel_metadata import (
     ChannelMetadata,
     HashScheme,
@@ -15,6 +18,7 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import polars as pl
 
+import cudf_polars.streaming.actor_graph.collectives.shuffle as shuffle_mod
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.engine.spmd import allgather_polars_dataframe
@@ -27,6 +31,9 @@ from cudf_polars.streaming.actor_graph.utils import (
     _is_already_partitioned,
 )
 from cudf_polars.testing.asserts import assert_gpu_result_equal
+
+if TYPE_CHECKING:
+    from cudf_polars.dsl.ir import IRExecutionContext
 
 
 @pytest.mark.parametrize(
@@ -140,6 +147,264 @@ def test_is_already_partitioned():
         ),
     )
     assert _is_already_partitioned(metadata_local, columns, modulus, nranks) is False
+
+
+class _FakeStatistics:
+    def __init__(self) -> None:
+        self.stats: dict[str, list[float]] = {}
+        self.report_entries: dict[str, tuple[list[str], Any]] = {}
+
+    def add_stat(self, name: str, value: float) -> None:
+        self.stats.setdefault(name, []).append(value)
+
+    def add_report_entry(
+        self, name: str, stat_names: list[str], formatter: Any
+    ) -> None:
+        self.report_entries.setdefault(name, (stat_names, formatter))
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self._statistics = _FakeStatistics()
+        self._br = object()
+
+    def statistics(self) -> _FakeStatistics:
+        return self._statistics
+
+    def br(self) -> object:
+        return self._br
+
+
+class _FakeComm:
+    rank = 0
+    nranks = 1
+
+
+class _FakeIRContext:
+    def __init__(self) -> None:
+        self.stream = object()
+
+    def get_cuda_stream(self) -> object:
+        return self.stream
+
+
+class _FakeChannel:
+    def __init__(self, messages: list[Any] | None = None) -> None:
+        self._messages = list(messages or [])
+        self.sent: list[Any] = []
+        self.drained = False
+
+    async def recv(self, context: _FakeContext) -> Any:
+        del context
+        if self._messages:
+            return self._messages.pop(0)
+        return None
+
+    async def send(self, context: _FakeContext, msg: Any) -> None:
+        del context
+        self.sent.append(msg)
+
+    async def drain(self, context: _FakeContext) -> None:
+        del context
+        self.drained = True
+
+
+def _capture_nvtx(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    messages: list[str] = []
+
+    def fake_annotate(
+        *, message: str, **kwargs: Any
+    ) -> contextlib.AbstractContextManager[None]:
+        del kwargs
+
+        @contextlib.contextmanager
+        def scope() -> Any:
+            messages.append(message)
+            yield
+
+        return scope()
+
+    monkeypatch.setattr(
+        shuffle_mod, "nvtx_annotate_cudf_polars", fake_annotate, raising=False
+    )
+    return messages
+
+
+def test_global_shuffle_metrics_skip_active_shuffle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = ChannelMetadata(
+        local_count=1,
+        partitioning=Partitioning(inter_rank=HashScheme((0,), 1), local="inherit"),
+    )
+    sent_metadata: list[ChannelMetadata] = []
+
+    async def fake_recv_metadata(
+        ch: _FakeChannel, context: _FakeContext
+    ) -> ChannelMetadata:
+        del ch, context
+        return metadata
+
+    async def fake_send_metadata(
+        ch: _FakeChannel, context: _FakeContext, metadata: ChannelMetadata
+    ) -> None:
+        del ch, context
+        sent_metadata.append(metadata)
+
+    monkeypatch.setattr(shuffle_mod, "recv_metadata", fake_recv_metadata)
+    monkeypatch.setattr(shuffle_mod, "send_metadata", fake_send_metadata)
+    monkeypatch.setattr(shuffle_mod, "_is_already_partitioned", lambda *args: True)
+    nvtx_messages = _capture_nvtx(monkeypatch)
+
+    context = _FakeContext()
+    ch_in = _FakeChannel([object()])
+    ch_out = _FakeChannel()
+
+    asyncio.run(
+        shuffle_mod._global_shuffle(
+            context,
+            _FakeComm(),
+            cast("IRExecutionContext", _FakeIRContext()),
+            ch_out,
+            ch_in,
+            columns_to_hash=(0,),
+            num_partitions=1,
+            collective_id=1,
+        )
+    )
+
+    assert sent_metadata == [metadata]
+    assert len(ch_out.sent) == 1
+    assert ch_out.drained
+    assert "cudf-polars-shuffle-total-time" in context.statistics().stats
+    assert "cudf-polars-shuffle-rapidsmpf-time" not in context.statistics().stats
+    assert context.statistics().report_entries["cudf-polars-shuffle-total-time"] == (
+        ["cudf-polars-shuffle-total-time"],
+        Formatter.Duration,
+    )
+    assert "cudf-polars-shuffle-total-time" in nvtx_messages
+    assert "cudf-polars-shuffle-rapidsmpf-time" not in nvtx_messages
+
+
+def test_global_shuffle_metrics_active_shuffle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = ChannelMetadata(local_count=1)
+    sent_metadata: list[ChannelMetadata] = []
+    inserted_columns: list[tuple[int, ...]] = []
+    extracted: list[tuple[int, object]] = []
+
+    async def fake_recv_metadata(
+        ch: _FakeChannel, context: _FakeContext
+    ) -> ChannelMetadata:
+        del ch, context
+        return metadata
+
+    async def fake_send_metadata(
+        ch: _FakeChannel, context: _FakeContext, metadata: ChannelMetadata
+    ) -> None:
+        del ch, context
+        sent_metadata.append(metadata)
+
+    class FakeTableChunk:
+        def make_available_and_spill(
+            self, br: object, *, allow_overbooking: bool
+        ) -> FakeTableChunk:
+            del br, allow_overbooking
+            return self
+
+        @classmethod
+        def from_message(cls, msg: object, br: object) -> FakeTableChunk:
+            del msg, br
+            return cls()
+
+        @classmethod
+        def from_pylibcudf_table(
+            cls,
+            table: object,
+            stream: object,
+            *,
+            exclusive_view: bool,
+            br: object,
+        ) -> tuple[object, object, bool, object]:
+            del cls
+            return (table, stream, exclusive_view, br)
+
+    class FakeMessage:
+        def __init__(self, partition_id: int, payload: object) -> None:
+            self.partition_id = partition_id
+            self.payload = payload
+
+    class FakeInserter:
+        async def __aenter__(self) -> FakeInserter:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def insert_hash(
+            self, chunk: FakeTableChunk, columns_to_hash: tuple[int, ...]
+        ) -> None:
+            del chunk
+            inserted_columns.append(columns_to_hash)
+
+    class FakeShuffleManager:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def inserting(self) -> FakeInserter:
+            return FakeInserter()
+
+        def local_partitions(self) -> list[int]:
+            return [0]
+
+        def extract_chunk(self, partition_id: int, stream: object) -> object:
+            extracted.append((partition_id, stream))
+            return object()
+
+    monkeypatch.setattr(shuffle_mod, "recv_metadata", fake_recv_metadata)
+    monkeypatch.setattr(shuffle_mod, "send_metadata", fake_send_metadata)
+    monkeypatch.setattr(shuffle_mod, "_is_already_partitioned", lambda *args: False)
+    monkeypatch.setattr(shuffle_mod, "TableChunk", FakeTableChunk)
+    monkeypatch.setattr(shuffle_mod, "Message", FakeMessage)
+    monkeypatch.setattr(shuffle_mod, "ShuffleManager", FakeShuffleManager)
+    nvtx_messages = _capture_nvtx(monkeypatch)
+
+    context = _FakeContext()
+    fake_ir_context = _FakeIRContext()
+    ir_context = cast("IRExecutionContext", fake_ir_context)
+    ch_in = _FakeChannel([object()])
+    ch_out = _FakeChannel()
+
+    asyncio.run(
+        shuffle_mod._global_shuffle(
+            context,
+            _FakeComm(),
+            ir_context,
+            ch_out,
+            ch_in,
+            columns_to_hash=(0,),
+            num_partitions=1,
+            collective_id=1,
+        )
+    )
+
+    assert len(sent_metadata) == 1
+    assert inserted_columns == [(0,)]
+    assert extracted == [(0, fake_ir_context.stream)]
+    assert len(ch_out.sent) == 1
+    assert ch_out.drained
+    assert "cudf-polars-shuffle-total-time" in context.statistics().stats
+    assert "cudf-polars-shuffle-rapidsmpf-time" in context.statistics().stats
+    assert context.statistics().report_entries["cudf-polars-shuffle-total-time"] == (
+        ["cudf-polars-shuffle-total-time"],
+        Formatter.Duration,
+    )
+    assert context.statistics().report_entries[
+        "cudf-polars-shuffle-rapidsmpf-time"
+    ] == (["cudf-polars-shuffle-rapidsmpf-time"], Formatter.Duration)
+    assert "cudf-polars-shuffle-total-time" in nvtx_messages
+    assert "cudf-polars-shuffle-rapidsmpf-time" in nvtx_messages
 
 
 @pytest.mark.spmd

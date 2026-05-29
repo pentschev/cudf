@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import time
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.communicator.single import new_communicator as single_comm
@@ -14,6 +16,7 @@ from rapidsmpf.integrations.cudf.partition import (
     unpack_and_concat as py_unpack_and_concat,
 )
 from rapidsmpf.shuffler import PartitionAssignment
+from rapidsmpf.statistics import Formatter
 from rapidsmpf.streaming.coll.shuffler import ShufflerAsync
 from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.context import Context
@@ -29,6 +32,7 @@ import pylibcudf as plc
 import pylibcudf.partitioning
 
 from cudf_polars.dsl.expr import Col
+from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.streaming.actor_graph.dispatch import (
     generate_ir_sub_network,
 )
@@ -43,7 +47,7 @@ from cudf_polars.streaming.shuffle import Shuffle
 from cudf_polars.utils.cuda_stream import stream_ordered_after
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterator
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.packed_data import PackedData
@@ -53,6 +57,22 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.streaming.actor_graph.core import SubNetGenerator
+
+
+_SHUFFLE_TOTAL_TIME = "cudf-polars-shuffle-total-time"
+_SHUFFLE_RAPIDSMPF_TIME = "cudf-polars-shuffle-rapidsmpf-time"
+
+
+@contextlib.contextmanager
+def _record_duration_stat(context: Context, name: str) -> Iterator[None]:
+    stats = context.statistics()
+    stats.add_report_entry(name, [name], Formatter.Duration)
+    start = time.monotonic()
+    with nvtx_annotate_cudf_polars(message=name):
+        try:
+            yield
+        finally:
+            stats.add_stat(name, time.monotonic() - start)
 
 
 class ShuffleManager:
@@ -372,60 +392,66 @@ async def _global_shuffle(
     collective_id
         The collective ID.
     """
-    metadata_in = await recv_metadata(ch_in, context)
+    with _record_duration_stat(context, _SHUFFLE_TOTAL_TIME):
+        metadata_in = await recv_metadata(ch_in, context)
 
-    # Check if we can skip the shuffle (already partitioned correctly)
-    if _is_already_partitioned(
-        metadata_in, columns_to_hash, num_partitions, comm.nranks
-    ):
-        # Forward metadata and data unchanged
-        await send_metadata(ch_out, context, metadata_in)
-        while (msg := await ch_in.recv(context)) is not None:
-            await ch_out.send(context, msg)
-        await ch_out.drain(context)
-        return
+        # Check if we can skip the shuffle (already partitioned correctly)
+        if _is_already_partitioned(
+            metadata_in, columns_to_hash, num_partitions, comm.nranks
+        ):
+            # Forward metadata and data unchanged
+            await send_metadata(ch_out, context, metadata_in)
+            while (msg := await ch_in.recv(context)) is not None:
+                await ch_out.send(context, msg)
+            await ch_out.drain(context)
+            return
 
-    # Normal shuffle path
-    output_metadata = ChannelMetadata(
-        local_count=max(1, num_partitions // comm.nranks),
-        partitioning=Partitioning(
-            inter_rank=HashScheme(columns_to_hash, num_partitions),
-            local="inherit",
-        ),
-    )
-    await send_metadata(ch_out, context, output_metadata)
-
-    # When input is duplicated, only rank 0 should contribute data.
-    # Other ranks still participate in the shuffle protocol.
-    skip_insert = metadata_in.duplicated and comm.rank != 0
-
-    shuffle = ShuffleManager(context, comm, num_partitions, collective_id)
-    async with shuffle.inserting() as inserter:
-        while (msg := await ch_in.recv(context)) is not None:
-            if not skip_insert:
-                inserter.insert_hash(
-                    TableChunk.from_message(
-                        msg, br=context.br()
-                    ).make_available_and_spill(context.br(), allow_overbooking=True),
-                    columns_to_hash,
-                )
-
-    for partition_id in shuffle.local_partitions():
-        stream = ir_context.get_cuda_stream()
-        await ch_out.send(
-            context,
-            Message(
-                partition_id,
-                TableChunk.from_pylibcudf_table(
-                    table=shuffle.extract_chunk(partition_id, stream),
-                    stream=stream,
-                    exclusive_view=True,
-                    br=context.br(),
-                ),
+        # Normal shuffle path
+        output_metadata = ChannelMetadata(
+            local_count=max(1, num_partitions // comm.nranks),
+            partitioning=Partitioning(
+                inter_rank=HashScheme(columns_to_hash, num_partitions),
+                local="inherit",
             ),
         )
+        await send_metadata(ch_out, context, output_metadata)
 
-    await ch_out.drain(context)
+        # When input is duplicated, only rank 0 should contribute data.
+        # Other ranks still participate in the shuffle protocol.
+        skip_insert = metadata_in.duplicated and comm.rank != 0
+
+        with _record_duration_stat(context, _SHUFFLE_RAPIDSMPF_TIME):
+            shuffle = ShuffleManager(context, comm, num_partitions, collective_id)
+            async with shuffle.inserting() as inserter:
+                while (msg := await ch_in.recv(context)) is not None:
+                    if not skip_insert:
+                        inserter.insert_hash(
+                            TableChunk.from_message(
+                                msg, br=context.br()
+                            ).make_available_and_spill(
+                                context.br(), allow_overbooking=True
+                            ),
+                            columns_to_hash,
+                        )
+
+            for partition_id in shuffle.local_partitions():
+                stream = ir_context.get_cuda_stream()
+                (
+                    await ch_out.send(
+                        context,
+                        Message(
+                            partition_id,
+                            TableChunk.from_pylibcudf_table(
+                                table=shuffle.extract_chunk(partition_id, stream),
+                                stream=stream,
+                                exclusive_view=True,
+                                br=context.br(),
+                            ),
+                        ),
+                    ),
+                )
+
+        await ch_out.drain(context)
 
 
 @define_actor()
