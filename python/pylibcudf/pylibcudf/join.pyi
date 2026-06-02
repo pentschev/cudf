@@ -162,3 +162,24 @@ class FilteredJoin:
         stream: CudaStreamLike | None = None,
         mr: DeviceMemoryResource | None = None,
     ) -> Column: ...
+
+class MarkJoin:
+    def __init__(
+        self,
+        build: Table,
+        compare_nulls: NullEquality = NullEquality.EQUAL,
+        load_factor: float = ...,
+        stream: CudaStreamLike | None = None,
+    ) -> None: ...
+    def semi_join(
+        self,
+        probe: Table,
+        stream: CudaStreamLike | None = None,
+        mr: DeviceMemoryResource | None = None,
+    ) -> Column: ...
+    def anti_join(
+        self,
+        probe: Table,
+        stream: CudaStreamLike | None = None,
+        mr: DeviceMemoryResource | None = None,
+    ) -> Column: ...

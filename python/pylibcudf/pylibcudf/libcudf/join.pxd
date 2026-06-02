@@ -24,6 +24,10 @@ ctypedef pair[gather_map_type, gather_map_type] gather_map_pair_type
 ctypedef optional[pair[size_t, device_span[const size_type]]] output_size_data_type
 
 cdef extern from "cudf/join/join.hpp" namespace "cudf" nogil:
+    cpdef enum class join_prefilter:
+        NO
+        YES
+
     cdef gather_map_pair_type inner_join(
         const table_view left_keys,
         const table_view right_keys,
@@ -240,6 +244,32 @@ cdef extern from "cudf/join/filtered_join.hpp" namespace "cudf" nogil:
         ) except +libcudf_exception_handler
         gather_map_type anti_join(
             const table_view left,
+            cudaStream_t stream,
+            device_async_resource_ref mr
+        ) except +libcudf_exception_handler
+
+cdef extern from "cudf/join/mark_join.hpp" namespace "cudf" nogil:
+    cdef cppclass mark_join:
+        mark_join(
+            const table_view build,
+            null_equality compare_nulls,
+            join_prefilter prefilter,
+            cudaStream_t stream
+        ) except +libcudf_exception_handler
+        mark_join(
+            const table_view build,
+            double load_factor,
+            null_equality compare_nulls,
+            join_prefilter prefilter,
+            cudaStream_t stream
+        ) except +libcudf_exception_handler
+        gather_map_type semi_join(
+            const table_view probe,
+            cudaStream_t stream,
+            device_async_resource_ref mr
+        ) except +libcudf_exception_handler
+        gather_map_type anti_join(
+            const table_view probe,
             cudaStream_t stream,
             device_async_resource_ref mr
         ) except +libcudf_exception_handler

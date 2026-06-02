@@ -152,3 +152,8 @@ cpdef Column mixed_left_anti_join(
 
 cdef class FilteredJoin:
     cdef unique_ptr[cpp_join.filtered_join] c_obj
+
+
+cdef class MarkJoin:
+    cdef unique_ptr[cpp_join.mark_join] c_obj
+    cdef object _build

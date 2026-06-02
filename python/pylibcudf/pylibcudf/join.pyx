@@ -37,6 +37,7 @@ __all__ = [
     "left_anti_join",
     "left_join",
     "left_semi_join",
+    "MarkJoin",
     "mixed_full_join",
     "mixed_inner_join",
     "mixed_left_anti_join",
@@ -974,6 +975,136 @@ cdef class FilteredJoin:
         with nogil:
             c_result = self.c_obj.get()[0].anti_join(
                 left.view(),
+                _cs,
+                mr.get_mr()
+            )
+        return _column_from_gather_map(move(c_result), _stream, mr)
+
+
+cdef class MarkJoin:
+    """
+    Mark-based hash join that builds a hash table from the build (left) table
+    on creation and probes results in subsequent join member functions.
+
+    The build table is reused as the left table across subsequent ``semi_join``
+    or ``anti_join`` calls. For use cases where the right filter table should be
+    reused with multiple left tables, use ``FilteredJoin`` instead.
+
+    For details, see :cpp:class:`cudf::mark_join`.
+    """
+
+    def __cinit__(
+        self,
+        Table build,
+        null_equality compare_nulls=null_equality.EQUAL,
+        double load_factor=0.5,
+        object stream=None,
+    ):
+        """
+        Construct a mark join object for subsequent probe calls.
+
+        Parameters
+        ----------
+        build : Table
+            The build (left) table used to build the hash table.
+        compare_nulls : NullEquality
+            Controls whether null join-key values should match or not.
+        load_factor : float, optional
+            The desired ratio of filled slots to total slots in the hash table,
+            must be in range (0,1]. Defaults to 0.5.
+        stream : Stream, optional
+            CUDA stream used for device memory operations and kernel launches.
+        """
+        cdef Stream _stream = _get_stream(stream)
+        cdef cudaStream_t _cs = _stream.view().value()
+        self._build = build
+
+        with nogil:
+            self.c_obj.reset(
+                new cpp_join.mark_join(
+                    build.view(),
+                    load_factor,
+                    compare_nulls,
+                    cpp_join.join_prefilter.NO,
+                    _cs
+                )
+            )
+
+    def semi_join(
+        self,
+        Table probe,
+        object stream=None,
+        DeviceMemoryResource mr=None,
+    ):
+        """
+        Returns a column of build row indices that have at least one match in
+        the probe table.
+
+        For details, see :cpp:func:`cudf::mark_join::semi_join`.
+
+        Parameters
+        ----------
+        probe : Table
+            The probe table.
+        stream : Stream, optional
+            CUDA stream used for device memory operations and kernel launches.
+        mr : DeviceMemoryResource, optional
+            Device memory resource used to allocate the returned column's device memory.
+
+        Returns
+        -------
+        Column
+            A column containing matching row indices from the build table.
+        """
+        cdef cpp_join.gather_map_type c_result
+
+        cdef Stream _stream = _get_stream(stream)
+        cdef cudaStream_t _cs = _stream.view().value()
+        mr = _get_memory_resource(mr)
+
+        with nogil:
+            c_result = self.c_obj.get()[0].semi_join(
+                probe.view(),
+                _cs,
+                mr.get_mr()
+            )
+        return _column_from_gather_map(move(c_result), _stream, mr)
+
+    def anti_join(
+        self,
+        Table probe,
+        object stream=None,
+        DeviceMemoryResource mr=None,
+    ):
+        """
+        Returns a column of build row indices that have no match in the probe
+        table.
+
+        For details, see :cpp:func:`cudf::mark_join::anti_join`.
+
+        Parameters
+        ----------
+        probe : Table
+            The probe table.
+        stream : Stream, optional
+            CUDA stream used for device memory operations and kernel launches.
+        mr : DeviceMemoryResource, optional
+            Device memory resource used to allocate the returned column's device memory.
+
+        Returns
+        -------
+        Column
+            A column containing unmatched row indices from the build table.
+        """
+        cdef cpp_join.gather_map_type c_result
+
+        cdef Stream _stream = _get_stream(stream)
+        cdef cudaStream_t _cs = _stream.view().value()
+        mr = _get_memory_resource(mr)
+
+        with nogil:
+            c_result = self.c_obj.get()[0].anti_join(
+                probe.view(),
                 _cs,
                 mr.get_mr()
             )
