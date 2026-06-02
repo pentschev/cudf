@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 from functools import cache
+from itertools import chain
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.communicator.single import new_communicator as single_comm
@@ -45,7 +46,7 @@ from cudf_polars.streaming.shuffle import Shuffle
 from cudf_polars.utils.cuda_stream import stream_ordered_after
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterable
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.packed_data import PackedData
@@ -274,6 +275,43 @@ class ShuffleManager:
         return self.shuffler.extract(partition_id)
 
 
+def _coalesce_packed_pieces(
+    pieces: Iterable[PackedData], target_size: int
+) -> Generator[list[PackedData], None, None]:
+    batch = []
+    batch_size = 0
+    for piece in pieces:
+        piece_size = piece.data_size()
+        if batch and batch_size + piece_size > target_size:
+            yield batch
+            batch = []
+            batch_size = 0
+        batch.append(piece)
+        batch_size += piece_size
+    if batch:
+        yield batch
+
+
+def _iter_packed_piece_batches(
+    pieces: Iterable[PackedData], target_size: int
+) -> Generator[list[PackedData], None, None]:
+    iterator = iter(pieces)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return
+
+    # Older RAPIDSMPF builds do not expose PackedData.data_size(); preserve the
+    # prior per-piece unpack behavior until a newer binding is available.
+    if not hasattr(first, "data_size"):
+        yield [first]
+        for piece in iterator:
+            yield [piece]
+        return
+
+    yield from _coalesce_packed_pieces(chain((first,), iterator), target_size)
+
+
 class LocalRepartitioner:
     """
     Local re-partitioner that wraps a completed :class:`ShuffleManager`.
@@ -285,10 +323,18 @@ class LocalRepartitioner:
         The repartitioner consumes whatever local partitions this rank owns.
     local_count
         Number of local output partitions to produce.
+    target_partition_size
+        Target packed payload byte size for each unpack batch.
     """
 
-    def __init__(self, shuffle: ShuffleManager, local_count: int) -> None:
+    def __init__(
+        self,
+        shuffle: ShuffleManager,
+        local_count: int,
+        target_partition_size: int,
+    ) -> None:
         self._global_shuffle = shuffle
+        self._target_partition_size = target_partition_size
         self._br = shuffle.context.br()
         options = Options(get_environment_variables())
         local_comm = single_comm(options, shuffle.comm.progress_thread)
@@ -302,9 +348,11 @@ class LocalRepartitioner:
 
     def _iter_chunks(self, stream: Stream) -> Generator[plc.Table, None, None]:
         for partition_id in self._global_shuffle.local_partitions():
-            for piece in self._global_shuffle.extract_pieces(partition_id):
-                # TODO: batch pieces up to target_partition_size before unpacking
-                table = py_unpack_and_concat([piece], stream=stream, br=self._br)
+            pieces = self._global_shuffle.extract_pieces(partition_id)
+            for batch in _iter_packed_piece_batches(
+                pieces, target_size=self._target_partition_size
+            ):
+                table = py_unpack_and_concat(batch, stream=stream, br=self._br)
                 if table.num_rows() > 0:
                     yield table
 

@@ -169,7 +169,9 @@ def test_local_repartitioner_hash(spmd_engine, local_count) -> None:
                     columns_to_hash=(0,),
                 )
 
-            local = LocalRepartitioner(shuffle, local_count=local_count)
+            local = LocalRepartitioner(
+                shuffle, local_count=local_count, target_partition_size=1_000_000
+            )
             await local.repartition_by_hash(columns_to_hash=(0,), stream=stream)
 
             for pid in local.local_partitions():
@@ -239,7 +241,9 @@ def test_local_repartitioner_index(spmd_engine, local_count) -> None:
                     ),
                 )
 
-            local = LocalRepartitioner(shuffle, local_count=local_count)
+            local = LocalRepartitioner(
+                shuffle, local_count=local_count, target_partition_size=1_000_000
+            )
             await local.repartition_by_index(partition_col=0, stream=stream)
 
             for pid in local.local_partitions():

@@ -544,6 +544,7 @@ async def _reassemble_input_chunks(
     sequence_numbers: list[int],
     ir: Over,
     tracer: Any,
+    target_partition_size: int,
 ) -> None:
     """Emit one output chunk per input chunk, in original order."""
     n_chunks = len(sequence_numbers)
@@ -555,7 +556,11 @@ async def _reassemble_input_chunks(
 
     # TODO: thread ir_context through repartition_by_index so each
     # PackedData piece moves on its own pool stream rather than sharing one.
-    local = LocalRepartitioner(return_shuffle, local_count=n_chunks)
+    local = LocalRepartitioner(
+        return_shuffle,
+        local_count=n_chunks,
+        target_partition_size=target_partition_size,
+    )
     await local.repartition_by_index(
         partition_col=chunk_index_column, stream=ir_context.get_cuda_stream()
     )
@@ -665,7 +670,14 @@ async def _shuffle_and_reassemble(
         stamps,
     )
     await _reassemble_input_chunks(
-        context, ch_out, ir_context, return_shuffle, sequence_numbers, ir, tracer
+        context,
+        ch_out,
+        ir_context,
+        return_shuffle,
+        sequence_numbers,
+        ir,
+        tracer,
+        target_partition_size,
     )
 
     await ch_out.drain(context)
