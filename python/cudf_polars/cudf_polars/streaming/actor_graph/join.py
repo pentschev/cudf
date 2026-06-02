@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -30,6 +31,7 @@ from pylibcudf.hashing import LIBCUDF_DEFAULT_HASH_SEED
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Join
 from cudf_polars.dsl.utils.naming import names_to_indices
+from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.collectives.shuffle import _global_shuffle
 from cudf_polars.streaming.actor_graph.dispatch import (
@@ -75,6 +77,7 @@ if TYPE_CHECKING:
 # cuDF column/concatenate row limit (int32)
 CUDF_ROW_LIMIT = 2**31 - 1
 MAX_BROADCAST_ROWS = CUDF_ROW_LIMIT // 2
+REUSABLE_FILTERED_JOIN_STATE_RESERVATION_FACTOR = 4
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,14 @@ class JoinStrategy:
     """The shuffle indices for the left side. Only used for shuffle joins."""
     right_indices: tuple[int, ...] = ()
     """The shuffle indices for the right side. Only used for shuffle joins."""
+
+
+@dataclass(frozen=True)
+class ReusableFilteredJoinState:
+    """Reusable right/filter-side state for broadcast semi/anti joins."""
+
+    right_keys: DataFrame
+    filtered_join: Any
 
 
 @define_actor()
@@ -234,6 +245,98 @@ async def _collect_small_side_for_broadcast(
     return dfs, size
 
 
+def _null_equality(nulls_equal: bool) -> plc.types.NullEquality:
+    return (
+        plc.types.NullEquality.EQUAL
+        if nulls_equal
+        else plc.types.NullEquality.UNEQUAL
+    )
+
+
+def _dataframe_data_size(df: DataFrame) -> int:
+    return sum(col.device_buffer_size() for col in df.table.columns())
+
+
+def _estimate_reusable_filtered_join_state_size(small_df: DataFrame) -> int:
+    # The FilteredJoin build allocation is opaque to RapidsMPF. Reserve enough
+    # for key expression buffers plus a conservative hash-table overhead, using
+    # the full small-frame footprint as the proxy for computed key size.
+    return max(
+        1,
+        _dataframe_data_size(small_df)
+        * REUSABLE_FILTERED_JOIN_STATE_RESERVATION_FACTOR,
+    )
+
+
+def _build_reusable_filtered_join_state(
+    ir: Join,
+    small_df: DataFrame,
+    *,
+    context: IRExecutionContext,
+) -> ReusableFilteredJoinState:
+    with context.stream_ordered_after(small_df) as stream:
+        right_keys = DataFrame(
+            broadcast(
+                *(expr.evaluate(small_df) for expr in ir.right_on), stream=stream
+            ),
+            stream=stream,
+        )
+        filtered_join = plc.join.FilteredJoin(
+            right_keys.table,
+            _null_equality(ir.options[1]),
+            stream=stream,
+        )
+        return ReusableFilteredJoinState(right_keys, filtered_join)
+
+
+def _evaluate_reusable_filtered_join(
+    ir: Join,
+    state: ReusableFilteredJoinState,
+    large_df: DataFrame,
+    *,
+    context: IRExecutionContext,
+) -> DataFrame:
+    with context.stream_ordered_after(large_df, state.right_keys) as stream:
+        left_keys = DataFrame(
+            broadcast(
+                *(expr.evaluate(large_df) for expr in ir.left_on), stream=stream
+            ),
+            stream=stream,
+        )
+        if ir.options[0] == "Semi":
+            gather_map = state.filtered_join.semi_join(left_keys.table, stream=stream)
+        else:
+            gather_map = state.filtered_join.anti_join(left_keys.table, stream=stream)
+        table = plc.copying.gather(
+            large_df.table,
+            gather_map,
+            plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+            stream=stream,
+        )
+        return DataFrame.from_table(
+            table,
+            large_df.column_names,
+            large_df.dtypes,
+            stream=stream,
+        )
+
+
+def _can_use_reusable_filtered_join(
+    ir: Join,
+    small_dfs: list[DataFrame],
+    large_child: IR,
+    broadcast_side: Literal["left", "right"],
+) -> bool:
+    return (
+        ir.options[0] in ("Semi", "Anti")
+        and broadcast_side == "right"
+        and len(small_dfs) == 1
+        and small_dfs[0].num_rows > 0
+        and ir.schema == large_child.schema
+        and ir.options[2] is None
+    )
+
+
 async def _broadcast_join_large_chunk(
     context: Context,
     ir: Join,
@@ -247,6 +350,7 @@ async def _broadcast_join_large_chunk(
     small_size: int,
     broadcast_side: Literal["left", "right"],
     *,
+    reusable_filtered_join: ReusableFilteredJoinState | None,
     tracer: ActorTracer | None,
 ) -> None:
     """Join one large-side chunk with the small DataFrame(s) and send the result."""
@@ -264,17 +368,30 @@ async def _broadcast_join_large_chunk(
     with opaque_memory_usage(
         await reserve_memory(context, size=input_bytes, net_memory_delta=0)
     ):
-        for sdf in dfs_to_join:
-            result = await ir_context.to_thread(
-                ir.do_evaluate,
-                *ir._non_child_args,
-                *([large_df, sdf] if broadcast_side == "right" else [sdf, large_df]),
+        if reusable_filtered_join is not None:
+            df = await ir_context.to_thread(
+                _evaluate_reusable_filtered_join,
+                ir,
+                reusable_filtered_join,
+                large_df,
                 context=ir_context,
             )
-            join_results.append(result)
+        else:
+            for sdf in dfs_to_join:
+                result = await ir_context.to_thread(
+                    ir.do_evaluate,
+                    *ir._non_child_args,
+                    *(
+                        [large_df, sdf]
+                        if broadcast_side == "right"
+                        else [sdf, large_df]
+                    ),
+                    context=ir_context,
+                )
+                join_results.append(result)
 
-        df = _concat(*join_results, context=ir_context)
-        del join_results
+            df = _concat(*join_results, context=ir_context)
+            del join_results
 
     if tracer is not None:
         tracer.add_chunk(table=df.table)
@@ -372,23 +489,52 @@ async def _broadcast_join(
         concat_size_limit=(target_partition_size if ir.options[0] == "Inner" else None),
     )
 
-    while (msg := await large_ch.recv(context)) is not None:
-        await _broadcast_join_large_chunk(
-            context,
-            ir,
-            ir_context,
-            ch_out,
-            small_dfs,
-            small_child,
-            TableChunk.from_message(msg, br=context.br()).make_available_and_spill(
-                context.br(), allow_overbooking=True
-            ),
-            large_child,
-            msg.sequence_number,
-            small_size,
-            broadcast_side,
-            tracer=tracer,
+    can_use_reusable_filtered_join = _can_use_reusable_filtered_join(
+        ir, small_dfs, large_child, broadcast_side
+    )
+    retained_state_context = contextlib.nullcontext()
+    if can_use_reusable_filtered_join:
+        retained_state_context = opaque_memory_usage(
+            await reserve_memory(
+                context,
+                size=_estimate_reusable_filtered_join_state_size(small_dfs[0]),
+                net_memory_delta=0,
+            )
         )
+
+    reusable_filtered_join = None
+    with retained_state_context:
+        try:
+            if can_use_reusable_filtered_join:
+                reusable_filtered_join = await ir_context.to_thread(
+                    _build_reusable_filtered_join_state,
+                    ir,
+                    small_dfs[0],
+                    context=ir_context,
+                )
+
+            while (msg := await large_ch.recv(context)) is not None:
+                await _broadcast_join_large_chunk(
+                    context,
+                    ir,
+                    ir_context,
+                    ch_out,
+                    small_dfs,
+                    small_child,
+                    TableChunk.from_message(
+                        msg, br=context.br()
+                    ).make_available_and_spill(
+                        context.br(), allow_overbooking=True
+                    ),
+                    large_child,
+                    msg.sequence_number,
+                    small_size,
+                    broadcast_side,
+                    reusable_filtered_join=reusable_filtered_join,
+                    tracer=tracer,
+                )
+        finally:
+            reusable_filtered_join = None
 
     await ch_out.drain(context)
 
