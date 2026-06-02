@@ -469,6 +469,8 @@ async def _distribute_by_group(
     key_indices: tuple[int, ...],
     ir_context: IRExecutionContext,
     skip_insert: bool,  # noqa: FBT001
+    *,
+    preserve_encoded: bool,
 ) -> list[int]:
     """Stream chunks from *ch_in* into the forward shuffle with origin stamps."""
     # We already have the upstream metadata; signal we don't need the replay
@@ -498,7 +500,9 @@ async def _distribute_by_group(
                     ir_context.get_cuda_stream(),
                     context.br(),
                 )
-                inserter.insert_hash(stamped, key_indices)
+                inserter.insert_hash(
+                    stamped, key_indices, preserve_encoded=preserve_encoded
+                )
             chunk_index += 1
     return sequence_numbers
 
@@ -598,6 +602,8 @@ async def _shuffle_and_reassemble(
     return_shuffle_collective_id: int,
     target_partition_size: int,
     sample_chunk_count: int,
+    *,
+    preserve_encoded: bool,
 ) -> None:
     """Hash-shuffle by partition keys, evaluate, then route rows back to their origin rank."""
     stamps = _origin_stamps_for(ir)
@@ -642,6 +648,7 @@ async def _shuffle_and_reassemble(
             ir.key_indices,
             ir_context,
             skip_insert,
+            preserve_encoded=preserve_encoded,
         ),
         replay_buffered_channel(
             context, ch_replay, ch_in, sample.chunks, metadata_in, trace_ir=ir
@@ -676,6 +683,8 @@ async def over_actor(
     target_partition_size: int,
     sample_chunk_count: int,
     scalar_plan: _ScalarOverPlan | None,
+    *,
+    preserve_encoded: bool,
 ) -> None:
     """
     Streaming actor for window ``over()`` expressions.
@@ -708,6 +717,9 @@ async def over_actor(
     scalar_plan
         Pre-computed IR rewrites for the scalar Over path, built at planning
         time. ``None`` for non-scalar Over nodes.
+    preserve_encoded
+        Whether RAPIDSMPF should preserve encoded columns while partitioning
+        and packing.
     """
     async with shutdown_on_error(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
@@ -769,6 +781,7 @@ async def over_actor(
                 return_shuffle_collective_id=collective_ids[1],
                 target_partition_size=target_partition_size,
                 sample_chunk_count=sample_chunk_count,
+                preserve_encoded=preserve_encoded,
             )
 
 
@@ -792,6 +805,7 @@ def _(
         else 0
     )
     scalar_plan = _build_scalar_over_plan(ir) if ir.is_scalar else None
+    preserve_encoded = executor.encoded_shuffle != "auto"
     actors[ir] = [
         over_actor(
             rec.state["context"],
@@ -804,6 +818,7 @@ def _(
             executor.target_partition_size,
             sample_chunk_count,
             scalar_plan,
+            preserve_encoded=preserve_encoded,
         )
     ]
     return actors, channels

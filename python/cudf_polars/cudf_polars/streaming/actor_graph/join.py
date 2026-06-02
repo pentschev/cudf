@@ -714,6 +714,7 @@ async def _shuffle_join(
     row_counts: tuple[int, int],
     tracer: ActorTracer | None,
     bloom_threshold: float,
+    preserve_encoded: bool,
 ) -> None:
     """Execute a shuffle (hash) join."""
     # Send output metadata
@@ -774,6 +775,7 @@ async def _shuffle_join(
                 strategy.left_indices,
                 strategy.shuffle_modulus,
                 collective_ids.pop(0),
+                preserve_encoded=preserve_encoded,
             ),
             _global_shuffle(
                 context,
@@ -784,6 +786,7 @@ async def _shuffle_join(
                 strategy.right_indices,
                 strategy.shuffle_modulus,
                 collective_ids.pop(0),
+                preserve_encoded=preserve_encoded,
             ),
             _join_chunks(
                 context,
@@ -1175,6 +1178,7 @@ async def join_actor(
         )
         ch_left_replay = context.create_channel()
         ch_right_replay = context.create_channel()
+        preserve_encoded = executor.encoded_shuffle != "auto"
         async with shutdown_on_error(
             context,
             ch_left_replay,
@@ -1241,6 +1245,7 @@ async def join_actor(
                             if executor.dynamic_planning is not None
                             else 0.0
                         ),
+                        preserve_encoded=preserve_encoded,
                     )
                 )
             await gather_in_task_group(*actor_tasks)

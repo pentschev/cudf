@@ -592,6 +592,11 @@ class StreamingExecutor:
     dynamic_planning
         Options controlling dynamic shuffle planning. See
         :class:`~cudf_polars.utils.config.DynamicPlanningOptions` for more.
+    encoded_shuffle
+        Policy for encoded columns during streaming shuffle packing.
+        ``"auto"`` materializes currently unsupported encoded columns via
+        RAPIDSMPF's encoded-policy path. ``"off"`` leaves RAPIDSMPF's default
+        partition packing behavior unchanged. Default is ``"off"``.
     max_io_threads
         Maximum number of IO threads. Default is 4.
         This controls the parallelism of IO operations when reading data.
@@ -654,6 +659,11 @@ class StreamingExecutor:
     )
     dynamic_planning: DynamicPlanningOptions | None = dataclasses.field(
         default_factory=DynamicPlanningOptions
+    )
+    encoded_shuffle: Literal["auto", "off"] = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__ENCODED_SHUFFLE", str, default="off"
+        )
     )
     max_io_threads: int = dataclasses.field(
         default_factory=_make_default_factory(
@@ -728,6 +738,10 @@ class StreamingExecutor:
             raise TypeError("broadcast_limit must be an int")
         if not isinstance(self.sink_to_directory, bool):
             raise TypeError("sink_to_directory must be bool")
+        if not isinstance(self.encoded_shuffle, str):
+            raise TypeError("encoded_shuffle must be a string")
+        if self.encoded_shuffle not in {"auto", "off"}:
+            raise ValueError("encoded_shuffle must be one of {'auto', 'off'}")
         if not isinstance(self.client_device_threshold, float):
             raise TypeError("client_device_threshold must be a float")
         if not isinstance(self.max_io_threads, int):

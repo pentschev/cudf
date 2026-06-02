@@ -73,6 +73,19 @@ def test_executor_options_num_py_executors() -> None:
     assert result["num_py_executors"] == 4
 
 
+def test_executor_options_encoded_shuffle_auto() -> None:
+    result = StreamingOptions(encoded_shuffle="auto").to_executor_options()
+    assert result["encoded_shuffle"] == "auto"
+
+
+def test_executor_options_encoded_shuffle_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDF_POLARS__EXECUTOR__ENCODED_SHUFFLE", "off")
+    result = StreamingOptions().to_executor_options()
+    assert result["encoded_shuffle"] == "off"
+
+
 @pytest.mark.parametrize("value", [True, False])
 def test_executor_options_sink_to_directory(*, value: bool) -> None:
     result = StreamingOptions(sink_to_directory=value).to_executor_options()
@@ -299,6 +312,11 @@ def test_from_argparse_stream_policy() -> None:
     )
 
 
+def test_from_argparse_encoded_shuffle() -> None:
+    opts = StreamingOptions._from_argparse(argparse.Namespace(encoded_shuffle="auto"))
+    assert opts.encoded_shuffle == "auto"
+
+
 # ---------------------------------------------------------------------------
 # _add_cli_args
 # ---------------------------------------------------------------------------
@@ -318,6 +336,8 @@ def test_add_cli_args_then_from_argparse_roundtrip() -> None:
             "4GiB",
             "--unbounded-file-read-cache",
             "host",
+            "--encoded-shuffle",
+            "auto",
         ]
     )
     opts = StreamingOptions._from_argparse(args)
@@ -326,6 +346,7 @@ def test_add_cli_args_then_from_argparse_roundtrip() -> None:
     assert opts.raise_on_fail is True
     assert opts.pinned_max_pool_size == "4GiB"
     assert opts.unbounded_file_read_cache == "host"
+    assert opts.encoded_shuffle == "auto"
     # Unprovided args default to None → UNSPECIFIED
     assert isinstance(opts.fallback_mode, Unspecified)
 
@@ -351,6 +372,7 @@ def test_to_dict_roundtrip() -> None:
         num_streaming_threads=4,
         log="DEBUG",
         raise_on_fail=True,
+        encoded_shuffle="auto",
     )
     assert StreamingOptions.from_dict(original.to_dict()) == original
 

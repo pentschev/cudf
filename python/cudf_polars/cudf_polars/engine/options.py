@@ -254,6 +254,14 @@ class StreamingOptions:
         Env: ``CUDF_POLARS__EXECUTOR__SINK_TO_DIRECTORY``.
         Default: ``True`` (forced by the streaming engines).
         Category: executor.
+    encoded_shuffle
+        Policy for encoded columns during streaming shuffle packing.
+        ``"auto"`` uses RAPIDSMPF's encoded-policy materialization path for
+        currently unsupported encoded columns. ``"off"`` leaves RAPIDSMPF's
+        default partition packing behavior unchanged.
+        Env: ``CUDF_POLARS__EXECUTOR__ENCODED_SHUFFLE``.
+        Default: ``"off"``.
+        Category: executor.
     raise_on_fail
         Raise instead of falling back to CPU.
         Default: ``False``.
@@ -347,6 +355,9 @@ class StreamingOptions:
     )
     sink_to_directory: bool | Unspecified = _opt(
         "executor", "CUDF_POLARS__EXECUTOR__SINK_TO_DIRECTORY", parse_boolean
+    )
+    encoded_shuffle: Literal["auto", "off"] | Unspecified = _opt(
+        "executor", "CUDF_POLARS__EXECUTOR__ENCODED_SHUFFLE"
     )
     # ---- Engine ----
     raise_on_fail: bool | Unspecified = _opt("engine")
@@ -527,6 +538,7 @@ class StreamingOptions:
             broadcast_limit=_get("broadcast_limit"),
             target_partition_size=target_partition_size,
             dynamic_planning=dynamic_planning,
+            encoded_shuffle=_get("encoded_shuffle"),
             raise_on_fail=_get("raise_on_fail"),
             parquet_options=_get("parquet_options"),
             memory_resource_config=_get("memory_resource_config"),
@@ -742,6 +754,19 @@ class StreamingOptions:
             help=textwrap.dedent("""\
                 Enable dynamic planning. Use --no-dynamic-planning to disable.
                 Env: CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING. Built-in default: enabled."""),
+        )
+        g.add_argument(
+            "--encoded-shuffle",
+            dest="encoded_shuffle",
+            default=None,
+            type=str,
+            choices=["auto", "off"],
+            help=textwrap.dedent("""\
+                Policy for encoded columns during streaming shuffle packing.
+                "auto" materializes currently unsupported encoded columns via
+                RAPIDSMPF's encoded-policy path; "off" leaves RAPIDSMPF's
+                default behavior unchanged.
+                Env: CUDF_POLARS__EXECUTOR__ENCODED_SHUFFLE. Built-in default: off."""),
         )
         g.add_argument(
             "--stream-policy",

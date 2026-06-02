@@ -281,6 +281,36 @@ def test_validate_cluster() -> None:
         )
 
 
+def test_encoded_shuffle_default_and_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDF_POLARS__EXECUTOR__ENCODED_SHUFFLE", raising=False)
+    config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+    assert config.executor.encoded_shuffle == "off"
+
+    config = ConfigOptions.from_polars_engine(
+        pl.GPUEngine(
+            executor="streaming",
+            executor_options={"encoded_shuffle": "auto"},
+        )
+    )
+    assert config.executor.encoded_shuffle == "auto"
+
+
+def test_encoded_shuffle_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDF_POLARS__EXECUTOR__ENCODED_SHUFFLE", "auto")
+    config = ConfigOptions.from_polars_engine(pl.GPUEngine(executor="streaming"))
+    assert config.executor.encoded_shuffle == "auto"
+
+
+def test_validate_encoded_shuffle() -> None:
+    with pytest.raises(ValueError, match="encoded_shuffle must be one of"):
+        ConfigOptions.from_polars_engine(
+            pl.GPUEngine(
+                executor="streaming",
+                executor_options={"encoded_shuffle": "invalid"},
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "option",
     [

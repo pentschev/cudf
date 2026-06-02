@@ -343,6 +343,7 @@ async def _shuffle_reduce(
     aggregated: TableChunk,
     input_drained: bool = False,
     tracer: ActorTracer | None = None,
+    preserve_encoded: bool,
 ) -> None:
     """
     Shuffle-based groupby or distinct.
@@ -376,6 +377,9 @@ async def _shuffle_reduce(
         Whether to use a local shuffle operation.
     aggregated
         The aggregated result for already-evaluated chunks.
+    preserve_encoded
+        Whether RAPIDSMPF should preserve encoded columns while partitioning
+        and packing.
     input_drained
         Whether the input channel is drained.
     tracer
@@ -407,6 +411,7 @@ async def _shuffle_reduce(
                 context.br(),
             ),
             decomposed.shuffle_indices,
+            preserve_encoded=preserve_encoded,
         )
         del aggregated
 
@@ -423,6 +428,7 @@ async def _shuffle_reduce(
                     aggregated, decomposed.reduction_ir.schema, context.br()
                 ),
                 decomposed.shuffle_indices,
+                preserve_encoded=preserve_encoded,
             )
             del aggregated
     extract_irs = [decomposed.reduction_ir] + (
@@ -604,6 +610,8 @@ async def groupby_actor(
     ch_in: Channel[TableChunk],
     target_partition_size: int,
     collective_ids: list[int],
+    *,
+    preserve_encoded: bool,
 ) -> None:
     """
     Dynamic GroupBy or Distinct actor that selects the best strategy at runtime.
@@ -631,6 +639,9 @@ async def groupby_actor(
         The target partition size.
     collective_ids
         The collective IDs.
+    preserve_encoded
+        Whether RAPIDSMPF should preserve encoded columns while partitioning
+        and packing.
     """
     async with shutdown_on_error(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
@@ -731,6 +742,7 @@ async def groupby_actor(
                 aggregated=aggregated,
                 input_drained=input_drained,
                 tracer=tracer,
+                preserve_encoded=preserve_encoded,
             )
 
 
@@ -753,6 +765,7 @@ def _(
     assert len(collective_ids) == 2, (
         f"{type(ir).__name__} requires 2 collective IDs, got {len(collective_ids)}"
     )
+    preserve_encoded = config_options.executor.encoded_shuffle != "auto"
     actors[ir] = [
         groupby_actor(
             rec.state["context"],
@@ -763,6 +776,7 @@ def _(
             channels[ir.children[0]].reserve_output_slot(),
             config_options.executor.target_partition_size,
             collective_ids,
+            preserve_encoded=preserve_encoded,
         )
     ]
 

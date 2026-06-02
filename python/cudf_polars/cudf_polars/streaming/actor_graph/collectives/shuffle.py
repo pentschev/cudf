@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import inspect
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf.communicator.single import new_communicator as single_comm
@@ -55,6 +57,48 @@ if TYPE_CHECKING:
     from cudf_polars.streaming.actor_graph.core import SubNetGenerator
 
 
+@cache
+def _partition_and_pack_supports_preserve_encoded() -> bool:
+    try:
+        parameters = inspect.signature(py_partition_and_pack).parameters
+    except (TypeError, ValueError):
+        return False
+    return "preserve_encoded" in parameters
+
+
+def _partition_and_pack(
+    *,
+    table: Any,
+    columns_to_hash: tuple[int, ...],
+    num_partitions: int,
+    stream: Stream,
+    br: Any,
+    preserve_encoded: bool,
+) -> dict[int, PackedData]:
+    if _partition_and_pack_supports_preserve_encoded():
+        return py_partition_and_pack(
+            table=table,
+            columns_to_hash=columns_to_hash,
+            num_partitions=num_partitions,
+            stream=stream,
+            br=br,
+            preserve_encoded=preserve_encoded,
+        )
+    if not preserve_encoded:
+        raise RuntimeError(
+            'encoded_shuffle="auto" requires a rapidsmpf build whose '
+            "partition_and_pack binding supports preserve_encoded. Install a "
+            'matching rapidsmpf build or set encoded_shuffle="off".'
+        )
+    return py_partition_and_pack(
+        table=table,
+        columns_to_hash=columns_to_hash,
+        num_partitions=num_partitions,
+        stream=stream,
+        br=br,
+    )
+
+
 class ShuffleManager:
     """
     ShufflerAsync manager.
@@ -92,16 +136,21 @@ class ShuffleManager:
             self._manager = manager
 
         def insert_hash(
-            self, chunk: TableChunk, columns_to_hash: tuple[int, ...]
+            self,
+            chunk: TableChunk,
+            columns_to_hash: tuple[int, ...],
+            *,
+            preserve_encoded: bool = True,
         ) -> None:
             """Partition chunk by hash and insert into the shuffler."""
             self._manager.shuffler.insert(
-                py_partition_and_pack(
+                _partition_and_pack(
                     table=chunk.table_view(),
                     columns_to_hash=columns_to_hash,
                     num_partitions=self._manager.num_partitions,
                     stream=chunk.stream,
                     br=self._manager.context.br(),
+                    preserve_encoded=preserve_encoded,
                 )
             )
 
@@ -349,6 +398,8 @@ async def _global_shuffle(
     columns_to_hash: tuple[int, ...],
     num_partitions: int,
     collective_id: int,
+    *,
+    preserve_encoded: bool,
 ) -> None:
     """
     Global shuffle implementation.
@@ -371,6 +422,9 @@ async def _global_shuffle(
         Number of partitions to shuffle into.
     collective_id
         The collective ID.
+    preserve_encoded
+        Whether RAPIDSMPF should preserve encoded columns while partitioning
+        and packing.
     """
     metadata_in = await recv_metadata(ch_in, context)
 
@@ -408,6 +462,7 @@ async def _global_shuffle(
                         msg, br=context.br()
                     ).make_available_and_spill(context.br(), allow_overbooking=True),
                     columns_to_hash,
+                    preserve_encoded=preserve_encoded,
                 )
 
     for partition_id in shuffle.local_partitions():
@@ -439,6 +494,8 @@ async def shuffle_actor(
     columns_to_hash: tuple[int, ...],
     num_partitions: int,
     collective_id: int,
+    *,
+    preserve_encoded: bool,
 ) -> None:
     """
     Execute a global shuffle pipeline within a single node.
@@ -467,6 +524,9 @@ async def shuffle_actor(
         Number of partitions to shuffle into.
     collective_id
         The collective ID.
+    preserve_encoded
+        Whether RAPIDSMPF should preserve encoded columns while partitioning
+        and packing.
     """
     async with shutdown_on_error(
         context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
@@ -480,6 +540,7 @@ async def shuffle_actor(
             columns_to_hash,
             num_partitions,
             collective_id,
+            preserve_encoded=preserve_encoded,
         )
 
 
@@ -504,6 +565,10 @@ def _(
 
     # Look up the reserved collective ID for this operation
     collective_id = rec.state["collective_id_map"][ir][0]
+    encoded_shuffle = getattr(
+        rec.state["config_options"].executor, "encoded_shuffle", "off"
+    )
+    preserve_encoded = encoded_shuffle != "auto"
 
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
@@ -520,6 +585,7 @@ def _(
             columns_to_hash=columns_to_hash,
             num_partitions=num_partitions,
             collective_id=collective_id,
+            preserve_encoded=preserve_encoded,
         )
     ]
 
