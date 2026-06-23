@@ -13,6 +13,7 @@ and may be modified or removed at any time.
 
 from __future__ import annotations
 
+import argparse
 import os
 from datetime import date
 from typing import TYPE_CHECKING
@@ -42,6 +43,15 @@ if TYPE_CHECKING:
 # on each worker takes ~15 sec extra
 os.environ["KVIKIO_COMPAT_MODE"] = os.environ.get("KVIKIO_COMPAT_MODE", "on")
 os.environ["KVIKIO_NTHREADS"] = os.environ.get("KVIKIO_NTHREADS", "8")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
 
 # The pre-computed expected results come from DuckDB, which has
 # different casting rules than Polars. For example, in polars
@@ -715,16 +725,29 @@ class PDSHQueries:
 
         var1 = date(1996, 1, 1)
         var2 = date(1996, 4, 1)
+        force_shuffle = run_config.extra_info.get("pdsh_q15_force_shuffle", False)
+
+        revenue_aggs = [
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
+            .sum()
+            .alias("total_revenue")
+        ]
+        if force_shuffle:
+            # n_unique requires a preshuffle on the group keys in cudf-polars.
+            # The result is dropped, so this only changes the physical shape.
+            revenue_aggs.append(
+                pl.col("l_suppkey").n_unique().alias("__q15_force_shuffle")
+            )
 
         revenue = (
             lineitem.filter(pl.col("l_shipdate").is_between(var1, var2, closed="left"))
             .group_by("l_suppkey")
-            .agg(
-                (pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
-                .sum()
-                .alias("total_revenue")
-            )
-            .select(pl.col("l_suppkey").alias("supplier_no"), pl.col("total_revenue"))
+            .agg(*revenue_aggs)
+        )
+        if force_shuffle:
+            revenue = revenue.filter(pl.col("__q15_force_shuffle") >= 0)
+        revenue = revenue.select(
+            pl.col("l_suppkey").alias("supplier_no"), pl.col("total_revenue")
         )
 
         frame = (
@@ -1002,13 +1025,22 @@ class PDSHQueries:
             pl.col("c_acctbal").mean().alias("avg_acctbal")
         )
 
-        q3 = orders.select(pl.col("o_custkey").unique()).with_columns(
-            pl.col("o_custkey").alias("c_custkey")
-        )
+        if run_config.extra_info.get("pdsh_q22_anti_join", False):
+            no_order_customers = q1.join(
+                orders.select(pl.col("o_custkey").alias("c_custkey")),
+                on="c_custkey",
+                how="anti",
+            )
+        else:
+            q3 = orders.select(pl.col("o_custkey").unique()).with_columns(
+                pl.col("o_custkey").alias("c_custkey")
+            )
+            no_order_customers = q1.join(q3, on="c_custkey", how="left").filter(
+                pl.col("o_custkey").is_null()
+            )
 
         frame = (
-            q1.join(q3, on="c_custkey", how="left")
-            .filter(pl.col("o_custkey").is_null())
+            no_order_customers
             .join(q2, how="cross")
             .filter(pl.col("c_acctbal") > pl.col("avg_acctbal"))
             .group_by("cntrycode")
@@ -1794,5 +1826,29 @@ class PDSHDuckDBQueries:
 
 if __name__ == "__main__":
     parser = build_parser(num_queries=22)
+    parser.add_argument(
+        "--pdsh-q15-force-shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("PDSH_Q15_FORCE_SHUFFLE"),
+        help=(
+            "Force PDS-H Q15's revenue aggregation onto a hash-shuffle path "
+            "by adding and dropping a preshuffle-only n_unique aggregation. "
+            "Env: PDSH_Q15_FORCE_SHUFFLE."
+        ),
+    )
+    parser.add_argument(
+        "--pdsh-q22-anti-join",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("PDSH_Q22_ANTI_JOIN"),
+        help=(
+            "Use an anti-join formulation for PDS-H Q22 instead of "
+            "materializing distinct orders keys. Env: PDSH_Q22_ANTI_JOIN."
+        ),
+    )
     args = parse_args(parser=parser)
+    args.extra_info = {
+        **args.extra_info,
+        "pdsh_q15_force_shuffle": args.pdsh_q15_force_shuffle,
+        "pdsh_q22_anti_join": args.pdsh_q22_anti_join,
+    }
     run_polars(PDSHQueries, args)
