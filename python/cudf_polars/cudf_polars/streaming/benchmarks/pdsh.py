@@ -1146,13 +1146,22 @@ class PDSHQueries:
             pl.col("c_acctbal").mean().alias("avg_acctbal")
         )
 
-        q3 = orders.select(pl.col("o_custkey").unique()).with_columns(
-            pl.col("o_custkey").alias("c_custkey")
-        )
+        if run_config.extra_info.get("pdsh_q22_anti_join", False):
+            no_order_customers = q1.join(
+                orders.select(pl.col("o_custkey").alias("c_custkey")),
+                on="c_custkey",
+                how="anti",
+            )
+        else:
+            q3 = orders.select(pl.col("o_custkey").unique()).with_columns(
+                pl.col("o_custkey").alias("c_custkey")
+            )
+            no_order_customers = q1.join(q3, on="c_custkey", how="left").filter(
+                pl.col("o_custkey").is_null()
+            )
 
         frame = (
-            q1.join(q3, on="c_custkey", how="left")
-            .filter(pl.col("o_custkey").is_null())
+            no_order_customers
             .join(q2, how="cross")
             .filter(pl.col("c_acctbal") > pl.col("avg_acctbal"))
             .group_by("cntrycode")
@@ -1959,10 +1968,20 @@ if __name__ == "__main__":
             "Env: PDSH_Q5_MEMORY_EFFICIENT."
         ),
     )
+    parser.add_argument(
+        "--pdsh-q22-anti-join",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("PDSH_Q22_ANTI_JOIN"),
+        help=(
+            "Use an anti-join formulation for PDS-H Q22 instead of "
+            "materializing distinct orders keys. Env: PDSH_Q22_ANTI_JOIN."
+        ),
+    )
     args = parse_args(parser=parser)
     args.extra_info = {
         **args.extra_info,
         "pdsh_q5_memory_efficient": args.pdsh_q5_memory_efficient,
         "pdsh_q9_memory_efficient": args.pdsh_q9_memory_efficient,
+        "pdsh_q22_anti_join": args.pdsh_q22_anti_join,
     }
     run_polars(PDSHQueries, args)
