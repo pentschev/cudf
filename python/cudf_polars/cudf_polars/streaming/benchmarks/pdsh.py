@@ -13,6 +13,7 @@ and may be modified or removed at any time.
 
 from __future__ import annotations
 
+import argparse
 import os
 from datetime import date
 from typing import TYPE_CHECKING
@@ -42,6 +43,14 @@ if TYPE_CHECKING:
 # on each worker takes ~15 sec extra
 os.environ["KVIKIO_COMPAT_MODE"] = os.environ.get("KVIKIO_COMPAT_MODE", "on")
 os.environ["KVIKIO_NTHREADS"] = os.environ.get("KVIKIO_NTHREADS", "8")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse common boolean environment values."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"", "0", "false", "no", "off"}
 
 # The pre-computed expected results come from DuckDB, which has
 # different casting rules than Polars. For example, in polars
@@ -486,29 +495,97 @@ class PDSHQueries:
         partsupp = get_data(path, "partsupp", suffix)
         supplier = get_data(path, "supplier", suffix)
 
-        frame = (
-            part.join(partsupp, left_on="p_partkey", right_on="ps_partkey")
-            .join(supplier, left_on="ps_suppkey", right_on="s_suppkey")
-            .join(
-                lineitem,
-                left_on=["p_partkey", "ps_suppkey"],
-                right_on=["l_partkey", "l_suppkey"],
-            )
-            .join(orders, left_on="l_orderkey", right_on="o_orderkey")
-            .join(nation, left_on="s_nationkey", right_on="n_nationkey")
-            .filter(pl.col("p_name").str.contains("green"))
-            .select(
-                pl.col("n_name").alias("nation"),
-                pl.col("o_orderdate").dt.year().alias("o_year"),
-                (
-                    pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
-                    - pl.col("ps_supplycost") * pl.col("l_quantity")
-                ).alias("amount"),
-            )
-            .group_by("nation", "o_year")
-            .agg(pl.sum("amount").round(2).alias("sum_profit"))
-            .sort(by=["nation", "o_year"], descending=[False, True])
+        amount = (
+            pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
+            - pl.col("ps_supplycost") * pl.col("l_quantity")
         )
+
+        if run_config.extra_info.get("pdsh_q9_memory_efficient", False):
+            green_part = part.filter(pl.col("p_name").str.contains("green")).select(
+                "p_partkey"
+            )
+
+            green_lineitem = lineitem.select(
+                "l_orderkey",
+                "l_partkey",
+                "l_suppkey",
+                "l_quantity",
+                "l_extendedprice",
+                "l_discount",
+            ).join(
+                green_part,
+                left_on="l_partkey",
+                right_on="p_partkey",
+                how="semi",
+            )
+
+            filtered_partsupp = (
+                green_part.join(
+                    partsupp.select("ps_partkey", "ps_suppkey", "ps_supplycost"),
+                    left_on="p_partkey",
+                    right_on="ps_partkey",
+                )
+                .join(
+                    supplier.select("s_suppkey", "s_nationkey"),
+                    left_on="ps_suppkey",
+                    right_on="s_suppkey",
+                )
+                .select("p_partkey", "ps_suppkey", "ps_supplycost", "s_nationkey")
+            )
+
+            line_profit = (
+                filtered_partsupp.join(
+                    green_lineitem,
+                    left_on=["p_partkey", "ps_suppkey"],
+                    right_on=["l_partkey", "l_suppkey"],
+                )
+                .select("l_orderkey", "s_nationkey", amount.alias("amount"))
+            )
+
+            frame = (
+                line_profit.join(
+                    orders.select(
+                        "o_orderkey",
+                        pl.col("o_orderdate").dt.year().alias("o_year"),
+                    ),
+                    left_on="l_orderkey",
+                    right_on="o_orderkey",
+                )
+                .group_by("s_nationkey", "o_year")
+                .agg(pl.sum("amount").round(2).alias("sum_profit"))
+                .join(
+                    nation.select("n_nationkey", "n_name"),
+                    left_on="s_nationkey",
+                    right_on="n_nationkey",
+                )
+                .select(
+                    pl.col("n_name").alias("nation"),
+                    "o_year",
+                    "sum_profit",
+                )
+                .sort(by=["nation", "o_year"], descending=[False, True])
+            )
+        else:
+            frame = (
+                part.join(partsupp, left_on="p_partkey", right_on="ps_partkey")
+                .join(supplier, left_on="ps_suppkey", right_on="s_suppkey")
+                .join(
+                    lineitem,
+                    left_on=["p_partkey", "ps_suppkey"],
+                    right_on=["l_partkey", "l_suppkey"],
+                )
+                .join(orders, left_on="l_orderkey", right_on="o_orderkey")
+                .join(nation, left_on="s_nationkey", right_on="n_nationkey")
+                .filter(pl.col("p_name").str.contains("green"))
+                .select(
+                    pl.col("n_name").alias("nation"),
+                    pl.col("o_orderdate").dt.year().alias("o_year"),
+                    amount.alias("amount"),
+                )
+                .group_by("nation", "o_year")
+                .agg(pl.sum("amount").round(2).alias("sum_profit"))
+                .sort(by=["nation", "o_year"], descending=[False, True])
+            )
 
         return QueryResult(
             frame=frame,
@@ -1794,5 +1871,19 @@ class PDSHDuckDBQueries:
 
 if __name__ == "__main__":
     parser = build_parser(num_queries=22)
+    parser.add_argument(
+        "--pdsh-q9-memory-efficient",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("PDSH_Q9_MEMORY_EFFICIENT"),
+        help=(
+            "Use a lower-memory formulation for PDS-H Q9 that narrows the "
+            "large intermediate and joins nation after aggregation. "
+            "Env: PDSH_Q9_MEMORY_EFFICIENT."
+        ),
+    )
     args = parse_args(parser=parser)
+    args.extra_info = {
+        **args.extra_info,
+        "pdsh_q9_memory_efficient": args.pdsh_q9_memory_efficient,
+    }
     run_polars(PDSHQueries, args)
