@@ -318,27 +318,94 @@ class PDSHQueries:
         var2 = date(1994, 1, 1)
         var3 = date(1995, 1, 1)
 
-        frame = (
-            region.join(nation, left_on="r_regionkey", right_on="n_regionkey")
-            .join(customer, left_on="n_nationkey", right_on="c_nationkey")
-            .join(orders, left_on="c_custkey", right_on="o_custkey")
-            .join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
-            .join(
-                supplier,
-                left_on=["l_suppkey", "n_nationkey"],
-                right_on=["s_suppkey", "s_nationkey"],
-            )
-            .filter(pl.col("r_name") == var1)
-            .filter(pl.col("o_orderdate").is_between(var2, var3, closed="left"))
-            .with_columns(
-                (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias(
-                    "revenue"
+        revenue = pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
+
+        if run_config.extra_info.get("pdsh_q5_memory_efficient", False):
+            selected_nation = (
+                region.filter(pl.col("r_name") == var1)
+                .select("r_regionkey")
+                .join(
+                    nation.select("n_nationkey", "n_name", "n_regionkey"),
+                    left_on="r_regionkey",
+                    right_on="n_regionkey",
                 )
+                .select("n_nationkey", "n_name")
             )
-            .group_by("n_name")
-            .agg(pl.sum("revenue"))
-            .sort(by="revenue", descending=True)
-        )
+
+            selected_orders = (
+                selected_nation.select("n_nationkey")
+                .join(
+                    customer.select("c_custkey", "c_nationkey"),
+                    left_on="n_nationkey",
+                    right_on="c_nationkey",
+                )
+                .join(
+                    orders.filter(
+                        pl.col("o_orderdate").is_between(var2, var3, closed="left")
+                    ).select("o_orderkey", "o_custkey"),
+                    left_on="c_custkey",
+                    right_on="o_custkey",
+                )
+                .select("o_orderkey", "n_nationkey")
+            )
+
+            selected_supplier = (
+                selected_nation.select(pl.col("n_nationkey").alias("s_nationkey"))
+                .join(
+                    supplier.select("s_suppkey", "s_nationkey"),
+                    on="s_nationkey",
+                )
+                .select("s_suppkey", "s_nationkey")
+            )
+
+            selected_lineitem = lineitem.select(
+                "l_orderkey",
+                "l_suppkey",
+                "l_extendedprice",
+                "l_discount",
+            ).join(
+                selected_supplier.select("s_suppkey"),
+                left_on="l_suppkey",
+                right_on="s_suppkey",
+                how="semi",
+            )
+
+            frame = (
+                selected_orders.join(
+                    selected_lineitem,
+                    left_on="o_orderkey",
+                    right_on="l_orderkey",
+                )
+                .join(
+                    selected_supplier,
+                    left_on=["l_suppkey", "n_nationkey"],
+                    right_on=["s_suppkey", "s_nationkey"],
+                )
+                .select("n_nationkey", revenue.alias("revenue"))
+                .group_by("n_nationkey")
+                .agg(pl.sum("revenue").alias("revenue"))
+                .join(selected_nation, on="n_nationkey")
+                .select("n_name", "revenue")
+                .sort(by="revenue", descending=True)
+            )
+        else:
+            frame = (
+                region.join(nation, left_on="r_regionkey", right_on="n_regionkey")
+                .join(customer, left_on="n_nationkey", right_on="c_nationkey")
+                .join(orders, left_on="c_custkey", right_on="o_custkey")
+                .join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
+                .join(
+                    supplier,
+                    left_on=["l_suppkey", "n_nationkey"],
+                    right_on=["s_suppkey", "s_nationkey"],
+                )
+                .filter(pl.col("r_name") == var1)
+                .filter(pl.col("o_orderdate").is_between(var2, var3, closed="left"))
+                .with_columns(revenue.alias("revenue"))
+                .group_by("n_name")
+                .agg(pl.sum("revenue"))
+                .sort(by="revenue", descending=True)
+            )
 
         return QueryResult(
             frame=frame,
@@ -1881,9 +1948,21 @@ if __name__ == "__main__":
             "Env: PDSH_Q9_MEMORY_EFFICIENT."
         ),
     )
+    parser.add_argument(
+        "--pdsh-q5-memory-efficient",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("PDSH_Q5_MEMORY_EFFICIENT"),
+        help=(
+            "Use a lower-memory formulation for PDS-H Q5 that derives the "
+            "selected region inside the query, prefilters lineitem by "
+            "eligible suppliers, and joins nation after aggregation. "
+            "Env: PDSH_Q5_MEMORY_EFFICIENT."
+        ),
+    )
     args = parse_args(parser=parser)
     args.extra_info = {
         **args.extra_info,
+        "pdsh_q5_memory_efficient": args.pdsh_q5_memory_efficient,
         "pdsh_q9_memory_efficient": args.pdsh_q9_memory_efficient,
     }
     run_polars(PDSHQueries, args)
