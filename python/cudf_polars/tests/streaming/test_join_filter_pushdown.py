@@ -506,6 +506,7 @@ def test_derived_selectivity_propagates_through_rewritten_children(
     assert expected_targets <= {semi.children[0] for semi in semis}
     assert_gpu_result_equal(query, engine=engine, check_row_order=False)
 
+
 def test_rewritten_domain_filters_other_side_instead_of_stacking(
     engine: SPMDEngine,
 ) -> None:
