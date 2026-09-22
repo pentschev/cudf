@@ -1245,18 +1245,22 @@ class RayEngine(StreamingEngine):
 
             exit_calls = [(actor, actor._exit.remote()) for actor in self._rank_actors]
             ready_exit_calls = wait_for_actor_calls(exit_calls, "_exit")
+            failed_exit_refs: set[ObjectRef] = set()
             for _, ref in ready_exit_calls:
                 try:
                     exit_events = ray.get(ref)
-                except ray.exceptions.RayActorError:
-                    pass  # expected: exit_actor() terminates the process immediately
+                except ray.exceptions.RayActorError as e:
+                    exceptions.append(e)
+                    failed_exit_refs.add(ref)
                 except Exception as e:
                     exceptions.append(e)
                 else:
                     self._quent_events_raw.extend(exit_events)
 
             shutdown_calls = [
-                (actor, actor.shutdown.remote()) for actor, _ in ready_exit_calls
+                (actor, actor.shutdown.remote())
+                for actor, ref in ready_exit_calls
+                if ref not in failed_exit_refs
             ]
             ready_shutdown_calls = wait_for_actor_calls(shutdown_calls, "shutdown")
             for _, ref in ready_shutdown_calls:

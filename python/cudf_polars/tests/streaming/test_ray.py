@@ -53,6 +53,18 @@ class _ActorBlockedInShutdown:
         time.sleep(5.0)
 
 
+@ray.remote
+class _ActorExitsDuringExit:
+    """Test actor that unexpectedly terminates during the first cleanup phase."""
+
+    def _exit(self) -> None:
+        ray.actor.exit_actor()
+
+    def shutdown(self) -> None:
+        msg = "shutdown must not be called after _exit fails"
+        raise AssertionError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Context-manager smoke tests (no GPU required)
 # ---------------------------------------------------------------------------
@@ -323,6 +335,41 @@ def test_shutdown_kills_actor_blocked_by_running_task(
         engine.shutdown()
         if ray.is_initialized():
             started.shutdown()
+        if started_ray:
+            ray.shutdown()
+
+
+def test_shutdown_reports_actor_error_during_exit(
+    ray_init_options: dict[str, Any],
+) -> None:
+    """An actor failure during ``_exit`` is unexpected and must be reported."""
+    started_ray = not ray.is_initialized()
+    if started_ray:
+        ray.init(**ray_init_options)
+
+    engine = RayEngine(
+        executor_options={"max_rows_per_partition": 10},
+        engine_options={"allow_gpu_sharing": True},
+        num_ranks=1,
+        ray_init_options=ray_init_options,
+    )
+    original_actor = engine.rank_actors[0]
+    actor = cast("Any", _ActorExitsDuringExit).remote()
+    try:
+        engine._rank_actors = [actor]
+        with pytest.raises(ExceptionGroup, match="Actor shutdown failed") as exc_info:
+            engine.shutdown()
+        assert any(
+            isinstance(exc, ray.exceptions.RayActorError)
+            for exc in exc_info.value.exceptions
+        )
+    finally:
+        try:
+            engine.shutdown()
+        finally:
+            for actor_to_kill in (actor, original_actor):
+                with contextlib.suppress(ray.exceptions.RayActorError):
+                    ray.kill(actor_to_kill, no_restart=True)
         if started_ray:
             ray.shutdown()
 
