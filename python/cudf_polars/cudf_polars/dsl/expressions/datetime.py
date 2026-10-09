@@ -10,7 +10,7 @@ import re
 import zoneinfo
 from enum import IntEnum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, cast
 
 import polars as pl
 from polars.exceptions import ComputeError, InvalidOperationError, SchemaError
@@ -471,19 +471,27 @@ _DURATION_TOKEN_NANOSECONDS = {
     "m": 60_000_000_000,
     "h": 3_600_000_000_000,
 }
-# Keep every intermediate of ``t - pymod(pymod(t, every) + c, every)`` (with
-# ``0 <= c < every``) representable in the column's integer type.
-_MAX_INT64_TRUNCATE_EVERY = 2**62
-_MAX_INT32_TRUNCATE_EVERY = 2**30
-# Durations, in nanoseconds, that libcudf's floor_datetimes supports directly.
-_FLOOR_DATETIMES_FREQUENCY = {
-    _NANOSECONDS_PER_DAY: plc.datetime.RoundingFrequency.DAY,
-    3_600_000_000_000: plc.datetime.RoundingFrequency.HOUR,
-    60_000_000_000: plc.datetime.RoundingFrequency.MINUTE,
-    1_000_000_000: plc.datetime.RoundingFrequency.SECOND,
-    1_000_000: plc.datetime.RoundingFrequency.MILLISECOND,
-    1_000: plc.datetime.RoundingFrequency.MICROSECOND,
-}
+# Largest bucket, in ticks, for which ``pymod(t, every)`` cannot overflow INT64.
+_MAX_TRUNCATE_TICKS = 2**62
+# Largest bucket, in months, for which the calendar arithmetic in
+# ``_month_start_days`` is exact in INT64.
+_MAX_TRUNCATE_MONTHS = 2**40
+# The Gregorian calendar repeats every 400 years.
+_DAYS_PER_400_YEARS = 146_097
+_MONTHS_PER_400_YEARS = 4_800
+# Durations, in nanoseconds, that libcudf's floor_datetimes supports directly,
+# and whether libcudf counts them in 32 bits.
+_FLOOR_DATETIMES_FREQUENCIES = (
+    (_NANOSECONDS_PER_DAY, plc.datetime.RoundingFrequency.DAY, True),
+    (3_600_000_000_000, plc.datetime.RoundingFrequency.HOUR, True),
+    (60_000_000_000, plc.datetime.RoundingFrequency.MINUTE, True),
+    (1_000_000_000, plc.datetime.RoundingFrequency.SECOND, False),
+    (1_000_000, plc.datetime.RoundingFrequency.MILLISECOND, False),
+    (1_000, plc.datetime.RoundingFrequency.MICROSECOND, False),
+)
+_INT64 = plc.DataType(plc.TypeId.INT64)
+_UINT64 = plc.DataType(plc.TypeId.UINT64)
+_AST = plc.expressions.ASTOperator
 
 
 class _TruncateMethod(IntEnum):
@@ -492,13 +500,25 @@ class _TruncateMethod(IntEnum):
     IDENTITY = auto()
     """Return the input unchanged."""
     FLOOR_DATETIMES = auto()
-    """Use libcudf's ``floor_datetimes`` with the frequency ``every``."""
-    TICKS = auto()
-    """Floor the column's integer representation to ``every``, anchored at ``origin``."""
-    DATE_MILLISECONDS = auto()
-    """Floor a Date on a millisecond timeline, then divide back to days."""
-    MONTHS = auto()
-    """Floor the number of calendar months since 1970-01 to a multiple of ``every``."""
+    """libcudf's ``floor_datetimes``."""
+    FIXED = auto()
+    """``t - pymod(t, every)``."""
+    WEEKLY = auto()
+    """``t - pymod(t - 4 days, every)``, anchoring weeks at Monday 1970-01-05."""
+    MONTHLY = auto()
+    """First day of the month, flooring the months since 1970-01 to ``every``."""
+
+
+class _TruncatePlan(NamedTuple):
+    """Device computation for a ``dt.truncate``, produced by :func:`_plan_truncate`."""
+
+    method: _TruncateMethod
+    every: int
+    """Ticks (FIXED, WEEKLY), months (MONTHLY), or a ``RoundingFrequency``."""
+    day: int
+    """Ticks per day (WEEKLY, MONTHLY)."""
+    on_date: bool
+    """Whether a Date is truncated, on a millisecond timeline."""
 
 
 def _parse_duration_string(every: str) -> tuple[int, int, int, int] | None:
@@ -532,7 +552,24 @@ def _parse_duration_string(every: str) -> tuple[int, int, int, int] | None:
     return months, weeks, days, nanoseconds
 
 
-def _plan_truncate(dtype: DataType, every: str) -> tuple[_TruncateMethod, int, int]:
+def _floor_datetimes_frequency(
+    tick: int, every_ns: int
+) -> plc.datetime.RoundingFrequency | None:
+    """
+    Return the floor_datetimes frequency for ``every_ns``, if it is exact.
+
+    libcudf counts days, hours and minutes in 32 bits, so those frequencies are
+    only used if every value of the column fits; otherwise the counts overflow.
+    """
+    for frequency_ns, frequency, count_is_int32 in _FLOOR_DATETIMES_FREQUENCIES:
+        if every_ns == frequency_ns:
+            if count_is_int32 and 2**63 // (frequency_ns // tick) >= 2**31:
+                return None
+            return frequency
+    return None
+
+
+def _plan_truncate(dtype: DataType, every: str) -> _TruncatePlan:
     """
     Translate ``dt.truncate(every)`` into a device computation.
 
@@ -545,11 +582,7 @@ def _plan_truncate(dtype: DataType, every: str) -> tuple[_TruncateMethod, int, i
 
     Returns
     -------
-    ``(method, every, origin)``. For ``TICKS`` the result is
-    ``t - pymod(t - origin, every)`` on the column's integer representation;
-    for ``FLOOR_DATETIMES`` ``every`` is a ``plc.datetime.RoundingFrequency``;
-    for ``DATE_MILLISECONDS`` ``every`` is in milliseconds; for ``MONTHS``
-    ``every`` is a number of months.
+    The device computation.
 
     Raises
     ------
@@ -559,49 +592,33 @@ def _plan_truncate(dtype: DataType, every: str) -> tuple[_TruncateMethod, int, i
 
     Notes
     -----
-    The polars semantics replicated here are:
+    This mirrors polars' ``truncate`` (``polars-time``) exactly, including
+    its wrapping 64-bit arithmetic near the limits of each time unit:
 
-    - Durations without months or weeks floor the epoch-relative value.
-    - Weeks are anchored at Monday 1970-01-05.
-    - Months, quarters and years floor the number of months since 1970-01
-      and return midnight on the first day of the month.
-    - A Datetime ``every`` is converted to the column's time unit with floor
-      division; if that is zero the input is returned unchanged.
-    - A Date with a sub-daily ``every`` is floored on a millisecond timeline,
-      and the result is divided back to days rounding toward zero (so it may
-      differ from casting the floored instant to a Date before 1970).
+    - A naive or UTC Datetime truncated by a duration without months or weeks
+      is floored relative to the epoch, by the whole duration converted to the
+      column's time unit one component at a time; if that is zero the input is
+      returned unchanged.
+    - Otherwise each unit is handled on its own (polars raises for zero or
+      mixed durations): fixed durations as above, weeks anchored at Monday
+      1970-01-05, and months, quarters and years by flooring the months since
+      1970-01 and returning midnight on the first day of the month.
+    - A Date is truncated the same way on a millisecond timeline, then divided
+      back to days rounding toward zero, which may differ from casting the
+      floored instant to a Date before 1970.
+
+    Polars computes calendar months with chrono, which panics beyond years
+    +/-262143; here those values follow the proleptic Gregorian calendar.
     """
     parsed = _parse_duration_string(every)
     if parsed is None:
         raise NotImplementedError(f"dt.truncate with every={every!r}")
     months, weeks, days, nanoseconds = parsed
-    if (months > 0) + (weeks > 0) + (days > 0 or nanoseconds > 0) > 1:
-        # polars raises: cannot mix month, week, day, and sub-daily units
-        raise NotImplementedError(f"dt.truncate with every={every!r}")
     type_id = dtype.id()
     if type_id == plc.TypeId.TIMESTAMP_DAYS:
-        if months > 0:
-            return _TruncateMethod.MONTHS, months, 0
-        if weeks > 0:
-            every_ticks, origin = 7 * weeks, 4
-        elif days > 0 and nanoseconds == 0:
-            every_ticks, origin = days, 0
-        elif days == 0 and nanoseconds > 0:
-            every_ms = nanoseconds // 1_000_000
-            if every_ms == 0:
-                return _TruncateMethod.IDENTITY, 0, 0
-            if every_ms > _MAX_INT64_TRUNCATE_EVERY:
-                raise NotImplementedError(f"dt.truncate with every={every!r}")
-            return _TruncateMethod.DATE_MILLISECONDS, every_ms, 0
-        else:
-            # polars raises for a zero duration and for mixing days with
-            # sub-daily units on a Date.
-            raise NotImplementedError(f"dt.truncate with every={every!r} on a Date")
-        if every_ticks == 1:
-            return _TruncateMethod.IDENTITY, 0, 0
-        if every_ticks > _MAX_INT32_TRUNCATE_EVERY:
-            raise NotImplementedError(f"dt.truncate with every={every!r}")
-        return _TruncateMethod.TICKS, every_ticks, origin
+        return _plan_unit_truncate(
+            every, months, weeks, days, nanoseconds, 1_000_000, on_date=True
+        )
     if type_id not in _TIMESTAMP_TICK_NANOSECONDS:
         raise NotImplementedError(  # pragma: no cover; polars raises first
             f"dt.truncate on {dtype.polars_type}"
@@ -612,175 +629,271 @@ def _plan_truncate(dtype: DataType, every: str) -> tuple[_TruncateMethod, int, i
         raise NotImplementedError(
             f"dt.truncate on a datetime with time zone {time_zone!r}"
         )
-    if months > 0:
-        return _TruncateMethod.MONTHS, months, 0
     tick = _TIMESTAMP_TICK_NANOSECONDS[type_id]
-    if weeks > 0:
-        every_ticks = 7 * weeks * _NANOSECONDS_PER_DAY // tick
-        origin = 4 * _NANOSECONDS_PER_DAY // tick
-    else:
-        every_ns = days * _NANOSECONDS_PER_DAY + nanoseconds
-        every_ticks = every_ns // tick
-        origin = 0
-        if every_ticks <= 1:
-            return _TruncateMethod.IDENTITY, 0, 0
-        if (frequency := _FLOOR_DATETIMES_FREQUENCY.get(every_ns)) is not None:
-            # libcudf divides by a compile-time constant, which is several
-            # times faster than the general path's runtime 64-bit division.
-            return _TruncateMethod.FLOOR_DATETIMES, int(frequency), 0
-    if every_ticks > _MAX_INT64_TRUNCATE_EVERY:
-        raise NotImplementedError(f"dt.truncate with every={every!r}")
-    return _TruncateMethod.TICKS, every_ticks, origin
-
-
-def _floor_ticks(
-    ticks: plc.Column, every: int, origin: int, stream: Stream
-) -> plc.Column:
-    """
-    Compute ``ticks - pymod(ticks - origin, every)`` for an integer column.
-
-    The shift by ``origin`` is applied as ``pymod(pymod(ticks, every) + c,
-    every)`` with ``c = pymod(-origin, every)`` so that no intermediate
-    overflows.
-    """
-    dtype = ticks.type()
-    col_ref = plc.expressions.ColumnReference(0)
-    every_literal = plc.expressions.Literal(
-        plc.Scalar.from_py(every, dtype, stream=stream)
-    )
-    remainder = plc.expressions.Operation(
-        plc.expressions.ASTOperator.PYMOD, col_ref, every_literal
-    )
-    if (shift := -origin % every) != 0:
-        remainder = plc.expressions.Operation(
-            plc.expressions.ASTOperator.PYMOD,
-            plc.expressions.Operation(
-                plc.expressions.ASTOperator.ADD,
-                remainder,
-                plc.expressions.Literal(
-                    plc.Scalar.from_py(shift, dtype, stream=stream)
-                ),
-            ),
-            every_literal,
+    if months > 0 or weeks > 0:
+        return _plan_unit_truncate(
+            every, months, weeks, days, nanoseconds, tick, on_date=False
         )
-    return plc.transform.compute_column(
-        plc.Table([ticks]),
-        plc.expressions.Operation(plc.expressions.ASTOperator.SUB, col_ref, remainder),
+    every_ticks = days * (_NANOSECONDS_PER_DAY // tick) + nanoseconds // tick
+    if every_ticks <= 1:
+        return _TruncatePlan(_TruncateMethod.IDENTITY, 0, 0, on_date=False)
+    frequency = _floor_datetimes_frequency(
+        tick, days * _NANOSECONDS_PER_DAY + nanoseconds
+    )
+    if frequency is not None:
+        # libcudf divides by a compile-time constant, which is several times
+        # faster than the general path's runtime 64-bit division.
+        return _TruncatePlan(
+            _TruncateMethod.FLOOR_DATETIMES, int(frequency), 0, on_date=False
+        )
+    if every_ticks > _MAX_TRUNCATE_TICKS:
+        raise NotImplementedError(f"dt.truncate with every={every!r}")
+    return _TruncatePlan(_TruncateMethod.FIXED, every_ticks, 0, on_date=False)
+
+
+def _plan_unit_truncate(
+    every: str,
+    months: int,
+    weeks: int,
+    days: int,
+    nanoseconds: int,
+    tick: int,
+    *,
+    on_date: bool,
+) -> _TruncatePlan:
+    """Plan polars' per-unit truncation, for ticks of ``tick`` nanoseconds."""
+    if (months > 0) + (weeks > 0) + (days > 0) + (nanoseconds > 0) != 1:
+        # polars raises for a zero duration and for mixing units.
+        raise NotImplementedError(f"dt.truncate with every={every!r}")
+    day = _NANOSECONDS_PER_DAY // tick
+    if months > 0:
+        if months > _MAX_TRUNCATE_MONTHS:
+            raise NotImplementedError(f"dt.truncate with every={every!r}")
+        return _TruncatePlan(_TruncateMethod.MONTHLY, months, day, on_date)
+    if weeks > 0:
+        method, every_ticks = _TruncateMethod.WEEKLY, 7 * weeks * day
+    else:
+        method, every_ticks = _TruncateMethod.FIXED, days * day + nanoseconds // tick
+        if every_ticks <= 1:
+            return _TruncatePlan(_TruncateMethod.IDENTITY, 0, 0, on_date)
+    if every_ticks > _MAX_TRUNCATE_TICKS:
+        raise NotImplementedError(f"dt.truncate with every={every!r}")
+    return _TruncatePlan(method, every_ticks, day, on_date)
+
+
+def _int64_literal(value: int, stream: Stream) -> plc.expressions.Literal:
+    return plc.expressions.Literal(plc.Scalar.from_py(value, _INT64, stream=stream))
+
+
+def _evaluate_int64(
+    columns: list[plc.Column], expression: plc.expressions.Expression, stream: Stream
+) -> plc.Column:
+    return plc.transform.compute_column(plc.Table(columns), expression, stream=stream)
+
+
+def _wrapping(
+    op: plc.binaryop.BinaryOperator,
+    lhs: plc.Column,
+    rhs: plc.Column | int,
+    stream: Stream,
+) -> plc.Column:
+    """Apply ``op`` to INT64 values modulo 2**64, as polars' arithmetic does."""
+    right = (
+        plc.unary.bit_cast(rhs, _UINT64, stream=stream)
+        if isinstance(rhs, plc.Column)
+        else plc.Scalar.from_py(rhs % 2**64, _UINT64, stream=stream)
+    )
+    return plc.unary.bit_cast(
+        plc.binaryop.binary_operation(
+            plc.unary.bit_cast(lhs, _UINT64, stream=stream),
+            right,
+            op,
+            _UINT64,
+            stream=stream,
+        ),
+        _INT64,
         stream=stream,
     )
 
 
-def _truncate_months(column: plc.Column, every: int, stream: Stream) -> plc.Column:
-    """Truncate timestamps to the start of a month, flooring months since 1970-01."""
-    int32 = plc.DataType(plc.TypeId.INT32)
+def _floor(ticks: plc.Column, every: int, stream: Stream) -> plc.Column:
+    """``ticks - pymod(ticks, every)``, wrapping on overflow."""
+    remainder = _evaluate_int64(
+        [ticks],
+        plc.expressions.Operation(
+            _AST.PYMOD,
+            plc.expressions.ColumnReference(0),
+            _int64_literal(every, stream),
+        ),
+        stream,
+    )
+    return _wrapping(plc.binaryop.BinaryOperator.SUB, ticks, remainder, stream)
+
+
+def _month_start_days(
+    ticks: plc.Column,
+    timestamp_type: plc.DataType,
+    months: int,
+    day: int,
+    stream: Stream,
+) -> plc.Column:
+    """
+    Days since the epoch of the first day of each value's month bucket.
+
+    The number of months since 1970-01 is floored to a multiple of ``months``.
+
+    libcudf's calendar functions use 16-bit years, so values are first moved
+    by whole 400-year cycles into the years 1970 to 2369, where they are exact.
+    The Gregorian calendar repeats every 400 years (146097 days, 4800 months),
+    so the cycles are added back afterwards in INT64.
+    """
+    a, b, c = (plc.expressions.ColumnReference(i) for i in range(3))
+
+    def lit(value: int) -> plc.expressions.Literal:
+        return _int64_literal(value, stream)
+
+    def op(
+        operator: plc.expressions.ASTOperator, *operands: plc.expressions.Expression
+    ) -> plc.expressions.Operation:
+        return plc.expressions.Operation(operator, *operands)
+
+    def evaluate(
+        columns: list[plc.Column], expression: plc.expressions.Expression
+    ) -> plc.Column:
+        return _evaluate_int64(columns, expression, stream)
+
+    def to_int64(column: plc.Column) -> plc.Column:
+        return plc.unary.cast(column, _INT64, stream=stream)
+
+    cycle = _DAYS_PER_400_YEARS * day
+    if cycle < 2**63:
+        cycles = evaluate([ticks], op(_AST.FLOOR_DIV, a, lit(cycle)))
+        within_cycle = evaluate(
+            [ticks, cycles], op(_AST.SUB, a, op(_AST.MUL, b, lit(cycle)))
+        )
+    else:
+        # Nanosecond timestamps only cover the years 1677 to 2262.
+        cycles = plc.Column.from_scalar(
+            plc.Scalar.from_py(0, _INT64, stream=stream), ticks.size(), stream=stream
+        )
+        within_cycle = ticks
+    timestamps = plc.unary.bit_cast(within_cycle, timestamp_type, stream=stream)
     year, month = (
-        plc.unary.cast(
-            plc.datetime.extract_datetime_component(column, component, stream=stream),
-            int32,
-            stream=stream,
+        to_int64(
+            plc.datetime.extract_datetime_component(
+                timestamps, component, stream=stream
+            )
         )
         for component in (
             plc.datetime.DatetimeComponent.YEAR,
             plc.datetime.DatetimeComponent.MONTH,
         )
     )
-
-    def literal(value: int) -> plc.expressions.Literal:
-        return plc.expressions.Literal(plc.Scalar.from_py(value, int32, stream=stream))
-
-    # (year - 1970) * 12 + (month - 1)
-    months_since_epoch = plc.expressions.Operation(
-        plc.expressions.ASTOperator.ADD,
-        plc.expressions.Operation(
-            plc.expressions.ASTOperator.MUL,
-            plc.expressions.Operation(
-                plc.expressions.ASTOperator.SUB,
-                plc.expressions.ColumnReference(0),
-                literal(1970),
-            ),
-            literal(12),
+    # Months since 1970-01: (year - 1970 + 400 * cycles) * 12 + month - 1.
+    months_since_epoch = op(
+        _AST.ADD,
+        op(
+            _AST.MUL,
+            op(_AST.ADD, op(_AST.SUB, a, lit(1970)), op(_AST.MUL, c, lit(400))),
+            lit(12),
         ),
-        plc.expressions.Operation(
-            plc.expressions.ASTOperator.SUB,
-            plc.expressions.ColumnReference(1),
-            literal(1),
+        op(_AST.SUB, b, lit(1)),
+    )
+    floored = evaluate(
+        [year, month, cycles],
+        op(
+            _AST.SUB,
+            months_since_epoch,
+            op(_AST.PYMOD, months_since_epoch, lit(months)),
         ),
     )
-    floored_months = plc.expressions.Operation(
-        plc.expressions.ASTOperator.SUB,
-        months_since_epoch,
-        plc.expressions.Operation(
-            plc.expressions.ASTOperator.PYMOD, months_since_epoch, literal(every)
+    # Back to days, from the month within its 400-year cycle.
+    cycles = evaluate([floored], op(_AST.FLOOR_DIV, a, lit(_MONTHS_PER_400_YEARS)))
+    month_in_cycle = plc.unary.cast(
+        evaluate(
+            [floored, cycles],
+            op(_AST.SUB, a, op(_AST.MUL, b, lit(_MONTHS_PER_400_YEARS))),
         ),
-    )
-    months = plc.transform.compute_column(
-        plc.Table([year, month]), floored_months, stream=stream
+        plc.DataType(plc.TypeId.INT32),
+        stream=stream,
     )
     epoch = plc.unary.bit_cast(
         plc.Column.from_scalar(
-            plc.Scalar.from_py(0, int32, stream=stream), column.size(), stream=stream
+            plc.Scalar.from_py(0, plc.DataType(plc.TypeId.INT32), stream=stream),
+            ticks.size(),
+            stream=stream,
         ),
         plc.DataType(plc.TypeId.TIMESTAMP_DAYS),
         stream=stream,
     )
-    result = plc.datetime.add_calendrical_months(epoch, months, stream=stream)
-    if result.type() != column.type():
-        result = plc.unary.cast(result, column.type(), stream=stream)
-    return result
+    days_in_cycle = to_int64(
+        plc.unary.bit_cast(
+            plc.datetime.add_calendrical_months(epoch, month_in_cycle, stream=stream),
+            plc.DataType(plc.TypeId.INT32),
+            stream=stream,
+        )
+    )
+    return evaluate(
+        [days_in_cycle, cycles],
+        op(_AST.ADD, a, op(_AST.MUL, b, lit(_DAYS_PER_400_YEARS))),
+    )
 
 
-def _truncate(
-    column: plc.Column,
-    method: _TruncateMethod,
-    every: int,
-    origin: int,
-    stream: Stream,
-) -> plc.Column:
+def _truncate(column: plc.Column, plan: _TruncatePlan, stream: Stream) -> plc.Column:
     """Evaluate a ``dt.truncate`` planned by :func:`_plan_truncate`."""
+    method, every, day, on_date = plan
     if method is _TruncateMethod.IDENTITY:
         return column
     if method is _TruncateMethod.FLOOR_DATETIMES:
         return plc.datetime.floor_datetimes(
             column, plc.datetime.RoundingFrequency(every), stream=stream
         )
-    if method is _TruncateMethod.MONTHS:
-        return _truncate_months(column, every, stream)
-    timestamp_type = column.type()
-    if method is _TruncateMethod.TICKS:
-        integer_type = plc.DataType(
-            plc.TypeId.INT32
-            if timestamp_type.id() == plc.TypeId.TIMESTAMP_DAYS
-            else plc.TypeId.INT64
+    if on_date:
+        timestamp_type = plc.DataType(plc.TypeId.TIMESTAMP_MILLISECONDS)
+        ticks = plc.unary.bit_cast(
+            plc.unary.cast(column, timestamp_type, stream=stream), _INT64, stream=stream
         )
-        ticks = plc.unary.bit_cast(column, integer_type, stream=stream)
-        return plc.unary.bit_cast(
-            _floor_ticks(ticks, every, origin, stream), timestamp_type, stream=stream
-        )
-    # DATE_MILLISECONDS: polars floors on a millisecond timeline and divides
-    # back to days with integer division, which rounds toward zero.
-    int64 = plc.DataType(plc.TypeId.INT64)
-    milliseconds = plc.unary.bit_cast(
-        plc.unary.cast(
-            column, plc.DataType(plc.TypeId.TIMESTAMP_MILLISECONDS), stream=stream
-        ),
-        int64,
-        stream=stream,
-    )
-    floored = _floor_ticks(milliseconds, every, 0, stream)
-    days = plc.transform.compute_column(
-        plc.Table([floored]),
-        plc.expressions.Operation(
-            plc.expressions.ASTOperator.DIV,
-            plc.expressions.ColumnReference(0),
-            plc.expressions.Literal(
-                plc.Scalar.from_py(_MILLISECONDS_PER_DAY, int64, stream=stream)
+    else:
+        timestamp_type = column.type()
+        ticks = plc.unary.bit_cast(column, _INT64, stream=stream)
+    if method is _TruncateMethod.FIXED:
+        result = _floor(ticks, every, stream)
+    elif method is _TruncateMethod.WEEKLY:
+        # polars computes ``t - pymod(t - 4 days, every)``, wrapping on overflow.
+        shifted = _wrapping(plc.binaryop.BinaryOperator.SUB, ticks, 4 * day, stream)
+        remainder = _evaluate_int64(
+            [shifted],
+            plc.expressions.Operation(
+                _AST.PYMOD,
+                plc.expressions.ColumnReference(0),
+                _int64_literal(every, stream),
             ),
+            stream,
+        )
+        result = _wrapping(plc.binaryop.BinaryOperator.SUB, ticks, remainder, stream)
+    else:
+        result = _wrapping(
+            plc.binaryop.BinaryOperator.MUL,
+            _month_start_days(ticks, timestamp_type, every, day, stream),
+            day,
+            stream,
+        )
+    if not on_date:
+        return plc.unary.bit_cast(result, column.type(), stream=stream)
+    # polars divides by a day with integer division, which rounds toward zero,
+    # and converts the result to 32 bits with wrapping.
+    days = _evaluate_int64(
+        [result],
+        plc.expressions.Operation(
+            _AST.DIV,
+            plc.expressions.ColumnReference(0),
+            _int64_literal(_MILLISECONDS_PER_DAY, stream),
         ),
-        stream=stream,
+        stream,
     )
     return plc.unary.bit_cast(
         plc.unary.cast(days, plc.DataType(plc.TypeId.INT32), stream=stream),
-        timestamp_type,
+        column.type(),
         stream=stream,
     )
 
@@ -1105,9 +1218,8 @@ class TemporalFunction(Expr):
             )
         elif self.name is TemporalFunction.Name.Truncate:
             (column, _) = columns
-            method, every, origin = self.options
             return Column(
-                _truncate(column.obj, method, every, origin, df.stream),
+                _truncate(column.obj, cast("_TruncatePlan", self.options), df.stream),
                 dtype=self.dtype,
             )
         elif self.name is TemporalFunction.Name.Date:
