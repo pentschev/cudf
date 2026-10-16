@@ -112,6 +112,11 @@ class RankAwareSource(abc.ABC):
     the source is treated as rank-unaware and runs on rank 0 only. This
     limitation is tracked in https://github.com/NVIDIA/cudf/issues/22917.
 
+    Order-sensitive operations, such as rolling and group_by_dynamic,
+    take the input order to be rank order: rank 0s rows, then rank 1s, and
+    so on. A source used with them should give each rank a contiguous range
+    of the frame, which the striped source below does not.
+
     Examples
     --------
     Register a source that stripes a shared frame across streaming ranks.

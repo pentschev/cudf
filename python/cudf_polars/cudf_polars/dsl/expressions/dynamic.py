@@ -6,8 +6,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-import polars as pl
-
 import pylibcudf as plc
 
 from cudf_polars.containers import Column
@@ -15,8 +13,6 @@ from cudf_polars.dsl.expressions.base import ExecutionContext, Expr
 from cudf_polars.dsl.expressions.datetime import _truncate
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers import DataFrame, DataType
@@ -28,48 +24,6 @@ _INT32 = plc.DataType(plc.TypeId.INT32)
 _INT64 = plc.DataType(plc.TypeId.INT64)
 _BOOL8 = plc.DataType(plc.TypeId.BOOL8)
 _I64_MIN, _I64_MAX = -(2**63), 2**63 - 1
-
-
-def _is_sorted(
-    columns: Sequence[plc.Column], null_order: plc.types.NullOrder, stream: Stream
-) -> bool:
-    """Whether ``columns`` are lexicographically ascending."""
-    n = len(columns)
-    return plc.sorting.is_sorted(
-        plc.Table(columns),
-        [plc.types.Order.ASCENDING] * n,
-        [null_order] * n,
-        stream=stream,
-    )
-
-
-def _is_sorted_within_groups(index: Column, keys: list[Column], stream: Stream) -> bool:
-    """
-    Whether ``index`` (without nulls) is ascending within each group of ``keys``.
-
-    The common input layouts are recognized in linear time: an index sorted
-    overall, or rows sorted by the keys and then the index. Otherwise only the
-    keys and the index are stably sorted by the keys and checked.
-    """
-    if index.check_sorted(
-        order=plc.types.Order.ASCENDING,
-        null_order=plc.types.NullOrder.BEFORE,
-        stream=stream,
-    ):
-        return True
-    columns = [*(k.obj for k in keys), index.obj]
-    nulls = (plc.types.NullOrder.BEFORE, plc.types.NullOrder.AFTER)
-    if any(_is_sorted(columns, null_order, stream) for null_order in nulls):
-        return True
-    n = len(keys)
-    grouped = plc.sorting.stable_sort_by_key(
-        plc.Table(columns),
-        plc.Table(columns[:n]),
-        [plc.types.Order.ASCENDING] * n,
-        [plc.types.NullOrder.BEFORE] * n,
-        stream=stream,
-    )
-    return _is_sorted(grouped.columns(), plc.types.NullOrder.BEFORE, stream)
 
 
 def _to_ticks(column: plc.Column, stream: Stream) -> plc.Column:
@@ -203,48 +157,21 @@ class DynamicWindowStart(Expr):
         offset: int,
         closed: Literal["left", "right"],
         index: Expr,
-        *keys: Expr,
     ) -> None:
         self.dtype = dtype
         self.plan = plan
         self.offset = offset
         self.closed = closed
-        # The group keys are only inputs to the sortedness check.
-        self.children = (index, *keys)
+        self.children = (index,)
         self.is_pointwise = True
-
-    @staticmethod
-    def _validate(index: Column, keys: list[Column], stream: Stream) -> None:
-        """
-        Raise the errors polars raises for an invalid index.
-
-        The streaming engine evaluates this one partition at a time, so an
-        index that only decreases across partitions is not detected yet.
-        """
-        if not keys:
-            if index.null_count > 0 or not index.check_sorted(
-                order=plc.types.Order.ASCENDING,
-                null_order=plc.types.NullOrder.BEFORE,
-                stream=stream,
-            ):
-                raise pl.exceptions.InvalidOperationError(
-                    "argument in operation 'group_by_dynamic' is not sorted, "
-                    "please sort the 'expr/series/column' first"
-                )
-        elif index.null_count > 0:
-            raise pl.exceptions.ComputeError(
-                "null values in dynamic group_by not supported, fill nulls."
-            )
-        elif not _is_sorted_within_groups(index, keys, stream):
-            raise pl.exceptions.ComputeError("input data is not sorted")
 
     def do_evaluate(
         self, df: DataFrame, *, context: ExecutionContext = ExecutionContext.FRAME
     ) -> Column:
         """Evaluate this expression given a dataframe for context."""
-        index, *keys = (child.evaluate(df, context=context) for child in self.children)
+        (child,) = self.children
+        index = child.evaluate(df, context=context)
         stream = df.stream
-        self._validate(index, keys, stream)
         dtype = self.dtype.plc_type
         shift = self.offset + (1 if self.closed == "right" else 0)
         if self.offset == 0 and shift == 0 and plc.traits.is_timestamp(dtype):

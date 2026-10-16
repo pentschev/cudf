@@ -51,6 +51,7 @@ from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.nodebase import Node
 from cudf_polars.dsl.to_ast import _DECIMAL_IDS, to_ast, to_parquet_filter
 from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
+from cudf_polars.dsl.utils.dynamic_index import index_error, raise_index_error
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.dsl.utils.per_path import PerPathValues
 from cudf_polars.dsl.utils.reshape import broadcast
@@ -101,6 +102,7 @@ __all__ = [
     "IR",
     "Cache",
     "CallbackSink",
+    "CheckDynamicIndex",
     "ConditionalJoin",
     "DataFrameScan",
     "Distinct",
@@ -2423,6 +2425,48 @@ def _has_struct_in_list(polars_type: pl.DataType) -> bool:
     while isinstance(current, pl.List):
         current = current.inner
     return isinstance(current, pl.Struct)
+
+
+class CheckDynamicIndex(IR):
+    """Raise polars' errors for an invalid ``group_by_dynamic`` index, else pass through."""
+
+    _preserves_output_order: ClassVar[bool] = True
+    __slots__ = ("index", "keys")
+    _non_child = ("schema", "index", "keys")
+    _n_non_child_args = 2
+    index: expr.NamedExpr
+    """The index column."""
+    keys: tuple[expr.NamedExpr, ...]
+    """The group keys, empty without ``group_by``."""
+
+    def __init__(
+        self,
+        schema: Schema,
+        index: expr.NamedExpr,
+        keys: Sequence[expr.NamedExpr],
+        df: IR,
+    ):
+        self.schema = schema
+        self.index = index
+        self.keys = tuple(keys)
+        self._non_child_args = (self.index, self.keys)
+        self.children = (df,)
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="CheckDynamicIndex")
+    def do_evaluate(
+        cls,
+        index: expr.NamedExpr,
+        keys: tuple[expr.NamedExpr, ...],
+        df: DataFrame,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        keys_ = [k.evaluate(df) for k in keys]
+        raise_index_error(index_error(index.evaluate(df), keys_, df.stream))
+        return df
 
 
 class GroupBy(IR):

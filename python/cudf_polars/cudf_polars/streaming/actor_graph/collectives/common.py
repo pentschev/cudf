@@ -12,6 +12,7 @@ from rapidsmpf.shuffler import Shuffler
 
 from cudf_polars.dsl.ir import (
     CallbackSink,
+    CheckDynamicIndex,
     Distinct,
     GroupBy,
     Rolling,
@@ -108,6 +109,7 @@ class ReserveOpIDs:
             StreamingScan,
             Sort,
             Rolling,
+            CheckDynamicIndex,
         )
         if self.dynamic_planning_enabled:
             collective_types = (
@@ -120,6 +122,7 @@ class ReserveOpIDs:
                 StreamingScan,
                 Sort,
                 Rolling,
+                CheckDynamicIndex,
                 GroupBy,
                 Distinct,
                 Over,

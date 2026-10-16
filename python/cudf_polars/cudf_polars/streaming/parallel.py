@@ -28,6 +28,7 @@ from cudf_polars.dsl.expr import Col, Literal, NamedExpr
 from cudf_polars.dsl.ir import (
     IR,
     Cache,
+    CheckDynamicIndex,
     ErrorNode,
     Filter,
     HConcat,
@@ -414,6 +415,24 @@ def _(
             ir, rec, msg="This filter is not supported for multiple partitions."
         )
 
+    new_node = ir.reconstruct([child])
+    partition_info[new_node] = partition_info[child]
+    return new_node, partition_info
+
+
+@lower_ir_node.register(CheckDynamicIndex)
+def _(
+    ir: CheckDynamicIndex, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    child, partition_info = rec(ir.children[0])
+    if partition_info[child].count > 1 and not all(
+        expr.is_pointwise for expr in traversal([k.value for k in ir.keys])
+    ):
+        return _lower_ir_fallback(
+            ir,
+            rec,
+            msg="group_by_dynamic keys are not supported for multiple partitions.",
+        )
     new_node = ir.reconstruct([child])
     partition_info[new_node] = partition_info[child]
     return new_node, partition_info

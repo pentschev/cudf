@@ -215,20 +215,17 @@ def rewrite_groupby_dynamic(
     )
     names = unique_names((*inp.schema, *schema))
 
+    index = expr.NamedExpr(index_name, expr.Col(index_dtype, index_name))
+    checked = ir.CheckDynamicIndex(inp.schema, index, keys, inp)
     start_name = next(names)
     start = DynamicWindowStart(
-        key_dtype,
-        window.plan,
-        window.offset,
-        dynamic.closed_window,
-        expr.Col(index_dtype, index_name),
-        *(k.value for k in keys),
+        key_dtype, window.plan, window.offset, dynamic.closed_window, index.value
     )
     with_start = ir.HStack(
         {**inp.schema, start_name: key_dtype},
         [expr.NamedExpr(start_name, start)],
         True,  # noqa: FBT003
-        inp,
+        checked,
     )
     start_col = expr.Col(key_dtype, start_name)
     narrow_start = DynamicWindowEnd(index_dtype, 0, 0, start_col)
